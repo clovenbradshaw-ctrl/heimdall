@@ -47,6 +47,12 @@ const app = {
   renewRequested: false,
   myIp: null,
   timers: [],
+  ledger: new Map(), // deviceKey -> { give, borrow }
+  relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec }
+  giverIdx: 0,
+  lendDevice: false,
+  hubEngine: null,
+  credit: { give: 0, borrow: 0, credit: 0 },
 };
 
 /* ---------------------------------------------------------------- storage */
@@ -176,6 +182,26 @@ async function rejoin() {
   }
 }
 
+async function lendMyDevice() {
+  if (app.lendDevice) return;
+  app.lendDevice = true;
+  lendBtnEl.disabled = true;
+  lendStatusEl.textContent = "loading model…";
+  app.hubEngine = new WorkerEngine((p) => {
+    lendStatusEl.textContent = p.text || `loading model ${Math.round((p.progress || 0) * 100)}%`;
+  });
+  try {
+    await app.hubEngine.load(app.modelId);
+    lendStatusEl.textContent = `${app.modelId} — you lend compute now`;
+    toast("you are giving compute back to the fleet");
+    renderFleet();
+  } catch (e) {
+    app.lendDevice = false;
+    lendBtnEl.disabled = false;
+    lendStatusEl.textContent = `failed: ${e.message}`;
+  }
+}
+
 async function reconcile() {
   if (!app.matrix || !app.roomId) return;
   const members = app.matrix.roomMembers();
@@ -234,6 +260,27 @@ function ensureWorkerLink(key, device) {
 }
 
 function onWorkerMessage(key, rec, msg) {
+  // A relayed job: worker borrowed from the fleet, tokens come back via the hub.
+  if (msg.type === "token" && app.relay.has(msg.id)) {
+    const r = app.relay.get(msg.id);
+    if (r.borrowerRec?.peer?.opened) r.borrowerRec.peer.send({ type: "token", id: msg.id, text: msg.text });
+    return;
+  }
+  if ((msg.type === "result" || msg.type === "error") && app.relay.has(msg.id)) {
+    const r = app.relay.get(msg.id);
+    app.relay.delete(msg.id);
+    if (msg.type === "result") settle(r.giverKey, r.borrowerKey);
+    if (r.borrowerRec?.peer?.opened) {
+      r.borrowerRec.peer.send({ type: msg.type, id: msg.id, text: msg.text, duration_ms: msg.duration_ms, message: msg.message });
+    }
+    renderFleet();
+    return;
+  }
+  // A worker borrowing from the fleet (reciprocal path).
+  if (msg.type === "job") {
+    onBorrowJob(key, rec, msg);
+    return;
+  }
   if (msg.type === "hello") {
     rec.hello = msg;
     rec.status = "ready";
@@ -252,11 +299,100 @@ function onWorkerMessage(key, rec, msg) {
   } else if (msg.type === "result") {
     consolePush(msg.id, `\n[done ${msg.duration_ms}ms]\n`);
     rec.lastSeen = Date.now();
+    // The hub borrowed from this worker — it gave compute. Credit it.
+    const l = app.ledger.get(key) || { give: 0, borrow: 0 };
+    l.give++;
+    app.ledger.set(key, l);
+    pushCredit(key, l);
     renderFleet();
   } else if (msg.type === "error") {
     consolePush(msg.id, `\n[error] ${msg.message}\n`);
     rec.status = "ready";
     renderFleet();
+  }
+}
+
+/* ------------------------------------------------------- reciprocal ledger */
+
+function ledgerOf(key) {
+  return app.ledger.get(key) || { give: 0, borrow: 0 };
+}
+
+function pushCredit(key, l) {
+  const rec = app.workers.get(key);
+  if (rec?.peer?.opened) {
+    rec.peer.send({ type: "credit", give: l.give, borrow: l.borrow, credit: l.give - l.borrow });
+  }
+}
+
+function settle(giverKey, borrowerKey) {
+  if (giverKey !== "self") {
+    const g = ledgerOf(giverKey);
+    g.give++;
+    app.ledger.set(giverKey, g);
+    pushCredit(giverKey, g);
+  }
+  const b = ledgerOf(borrowerKey);
+  b.borrow++;
+  app.ledger.set(borrowerKey, b);
+  pushCredit(borrowerKey, b);
+}
+
+function onBorrowJob(borrowerKey, rec, msg) {
+  const l = ledgerOf(borrowerKey);
+  if (l.borrow >= l.give) {
+    rec.peer.send({ type: "error", id: msg.id, message: "no credit — you have to give compute before you can borrow. Serve a job first." });
+    return;
+  }
+  const giver = pickGiver(borrowerKey);
+  if (!giver) {
+    rec.peer.send({ type: "error", id: msg.id, message: "no giver available right now" });
+    return;
+  }
+  const req = {
+    type: "infer",
+    id: msg.id,
+    messages: msg.messages || [{ role: "user", content: msg.prompt }],
+    stream: true,
+    temperature: msg.temperature ?? 0.7,
+    max_tokens: msg.max_tokens ?? 1024,
+  };
+  app.relay.set(msg.id, { giverKey: giver.key, borrowerKey, borrowerRec: rec });
+  if (giver.key === "self") {
+    serveSelf(req, rec);
+  } else {
+    giver.rec.peer.send(req);
+  }
+}
+
+function pickGiver(borrowerKey) {
+  const ready = [...app.workers.values()].filter((w) => {
+    const key = deviceKey(w.device);
+    const leaseDead = w.hello?.leaseUntil && Date.now() > w.hello.leaseUntil;
+    return key !== borrowerKey && w.status === "ready" && w.peer?.opened && !leaseDead;
+  });
+  if (ready.length === 0) {
+    return app.lendDevice && app.hubEngine?.loaded ? { key: "self" } : null;
+  }
+  const pick = ready[app.giverIdx % ready.length];
+  app.giverIdx++;
+  return { key: deviceKey(pick.device), rec: pick };
+}
+
+async function serveSelf(req, borrowerRec) {
+  const t0 = Date.now();
+  try {
+    const { text } = await app.hubEngine.infer(
+      req.messages,
+      { stream: true, temperature: req.temperature, max_tokens: req.max_tokens },
+      (delta) => borrowerRec.peer?.send({ type: "token", id: req.id, text: delta }),
+    );
+    settle("self", app.relay.get(req.id)?.borrowerKey || "");
+    borrowerRec.peer?.send({ type: "result", id: req.id, text, duration_ms: Date.now() - t0 });
+  } catch (e) {
+    borrowerRec.peer?.send({ type: "error", id: req.id, message: String(e?.message || e) });
+  } finally {
+    app.relay.delete(req.id);
   }
 }
 
@@ -412,6 +548,24 @@ async function onWorkerRtcMessage(peer, msg) {
     toast(`${share.name || "the host"} asked you to renew your compute lease`);
     return;
   }
+  if (msg.type === "credit") {
+    app.credit = { give: msg.give, borrow: msg.borrow, credit: msg.credit };
+    renderWorkerStatus();
+    updateComposer();
+    return;
+  }
+  if (msg.type === "token") {
+    workerConsolePush(msg.text);
+    return;
+  }
+  if (msg.type === "result") {
+    workerConsolePush(`\n[done ${msg.duration_ms}ms]\n`);
+    return;
+  }
+  if (msg.type === "error") {
+    workerConsolePush(`\n[error] ${msg.message}\n`);
+    return;
+  }
   if (msg.type !== "infer") return;
   if (!app.engine) {
     peer.send({ type: "error", id: msg.id, message: "engine not ready" });
@@ -439,6 +593,37 @@ async function onWorkerRtcMessage(peer, msg) {
   }
 }
 
+function borrowNow() {
+  const prompt = borrowEl?.value?.trim();
+  if (!prompt) return;
+  if (app.credit.credit <= 0) {
+    toast("no credit — serve compute to the fleet first, then borrow");
+    return;
+  }
+  const peer = [...app.peers.values()].find((p) => p.opened);
+  if (!peer) {
+    toast("not connected to the fleet");
+    return;
+  }
+  workerConsolePush(`▶ ${prompt}\n`);
+  peer.send({ type: "job", id: crypto.randomUUID(), prompt, temperature: 0.7, max_tokens: 1024 });
+}
+
+function workerConsolePush(text) {
+  if (!workerConsoleEl) return;
+  workerConsoleEl.textContent += text;
+  workerConsoleEl.scrollTop = workerConsoleEl.scrollHeight;
+}
+
+function updateComposer() {
+  if (!borrowBtnEl) return;
+  const can = app.credit.credit > 0;
+  borrowBtnEl.disabled = !can;
+  borrowHintEl.textContent = can
+    ? `credit ${app.credit.credit} — you can borrow`
+    : "you have not given any compute yet — serve a job first, then you can borrow";
+}
+
 async function keepAwake() {
   try {
     if ("wakeLock" in navigator) {
@@ -456,8 +641,8 @@ async function keepAwake() {
 
 /* ------------------------------------------------------------------- view */
 
-let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, consoleEl;
-let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, noteEl, identityEl;
+let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
+let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, noteEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
 function header() {
   return el("header", { class: "site" }, [
@@ -551,11 +736,23 @@ function controllerView() {
     consoleEl,
   ]);
 
+  lendBtnEl = el("button", {
+    class: "ghost",
+    text: "Lend my device",
+    onclick: lendMyDevice,
+  });
+  lendStatusEl = el("div", { class: "muted small" });
+  const lendCard = el("div", { class: "card" }, [
+    el("h2", { text: "Give compute" }),
+    el("p", { class: "muted", text: "Inference runs both ways. Lend this device too, and you earn credit back to the fleet instead of only borrowing." }),
+    el("div", { class: "row" }, [lendBtnEl, lendStatusEl]),
+  ]);
+
   return el("div", { class: "view" }, [
     header(),
     el("div", { class: "card" }, [
       el("h2", { text: "Fleet" }),
-      el("p", { class: "muted", text: "The link names you, carries an expiry, and makes the worker show its own IP before accepting. The room is only a directory — prompts and answers travel device-to-device over WebRTC, never through the room." }),
+      el("p", { class: "muted", text: "The link names you, carries an expiry, and makes the worker show its own IP before accepting. The room is only a directory — prompts and answers travel device-to-device over WebRTC, never through the room. Everyone who borrows must first give." }),
       el("label", { text: "your name" }),
       nameEl,
       el("div", { class: "row", style: "" }, [createBtn, freshBtn]),
@@ -564,6 +761,7 @@ function controllerView() {
     ]),
     fleetCardEl,
     promptCardEl,
+    lendCard,
     foldCard(),
     loginCard(),
     footer(),
@@ -585,6 +783,10 @@ function renderFleet() {
     const meta = h
       ? `${h.model || ""}${h.note ? ` · said “${h.note.slice(0, 48)}${h.note.length > 48 ? "…" : ""}”` : ""}`
       : `linking…`;
+    const l = ledgerOf(key);
+    const credit = l.give || l.borrow
+      ? ` · gave ${l.give} took ${l.borrow}`
+      : "";
     const lease = el("span", {
       class: "countdown muted",
       "data-until": h?.leaseUntil || 0,
@@ -595,7 +797,7 @@ function renderFleet() {
         statusDot(color, rec.status),
         el("div", { class: "who" }, [
           el("div", { class: "name", text: name }),
-          el("div", { class: "meta", text: meta }),
+          el("div", { class: "meta", text: meta + credit }),
           el("div", { class: "meta", text: lastSeenText(rec.lastSeen) + (rec.renewed ? " · renewed" : "") }),
         ]),
         lease,
@@ -654,7 +856,7 @@ function workerView() {
 
   acceptCard.append(
     el("h2", { text: "Lend this device" }),
-    el("p", { class: "muted", text: `Accepting runs a small language model in this tab and makes it available to ${who}. Nothing is stored on a server; your device does the compute. The lease lasts 12 hours and must be renewed.` }),
+    el("p", { class: "muted", text: `Accepting runs a small language model in this tab and makes it available to ${who}. Nothing is stored on a server; your device does the compute. The lease lasts 12 hours and must be renewed. Inference is mutual — you lend your compute, and you can borrow from the fleet only what you have given.` }),
     el("label", { text: "model" }),
     modelSel,
     el("div", { class: "row" }, [
@@ -675,6 +877,18 @@ function workerView() {
   statusEl = el("div", { class: "col" });
   modelStatusEl = el("span", { class: "muted small" });
 
+  borrowEl = el("textarea", { placeholder: "borrow compute from the fleet — ask anything…" });
+  borrowBtnEl = el("button", { class: "primary", text: "Borrow compute", disabled: "", onclick: borrowNow });
+  borrowHintEl = el("div", { class: "muted small", text: "you have not given any compute yet — serve a job first, then you can borrow" });
+  workerConsoleEl = el("div", { class: "console", text: "" });
+  const borrowCard = el("div", { class: "card" }, [
+    el("h2", { text: "Borrow compute" }),
+    el("p", { class: "muted", text: "Inference is mutual: you give compute by serving jobs, and you can borrow from the fleet only what you have already given." }),
+    borrowEl,
+    el("div", { class: "row" }, [borrowBtnEl, borrowHintEl]),
+    workerConsoleEl,
+  ]);
+
   return el("div", { class: "view" }, [
     header(),
     roomBox,
@@ -689,6 +903,7 @@ function workerView() {
       statusEl,
       modelStatusEl,
     ]),
+    borrowCard,
     foldCard(),
     loginCard(),
     footer(),
@@ -727,6 +942,10 @@ function renderWorkerStatus() {
     : app.leaseUntil
       ? el("span", { class: "countdown badge ok", "data-until": app.leaseUntil, text: `lease ${countdownText(app.leaseUntil)}` })
       : el("span", { class: "badge", text: "no lease yet" });
+  const creditBadge = el("span", {
+    class: `badge ${app.credit.credit > 0 ? "ok" : "warn"}`,
+    text: `credit ${app.credit.credit} (gave ${app.credit.give}, took ${app.credit.borrow})`,
+  });
   const renewBtn = app.leaseExpired || app.renewRequested
     ? el("button", { class: "primary small", text: "Renew now", onclick: acceptDuty })
     : null;
@@ -735,6 +954,7 @@ function renderWorkerStatus() {
       el("span", { class: "badge", text: `links: ${online}` }),
       app.wakeLock ? el("span", { class: "badge ok", text: "screen awake" }) : null,
       el("span", { class: "badge", text: `model: ${app.modelId}` }),
+      creditBadge,
       leaseBadge,
       renewBtn,
     ]),
@@ -796,6 +1016,7 @@ function main() {
       app.leaseExpired = saved <= Date.now();
     }
     renderWorkerStatus();
+    updateComposer();
   }
   if (import.meta.env.PROD && "serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});

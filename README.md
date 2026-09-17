@@ -49,6 +49,23 @@ The handshake is consent-first, and everything is time-bound:
   answering and the host is prompted to nudge them. Renewal is a fresh accept,
   on the worker's side, by their own hand.
 
+## Inference is mutual
+
+There are no passive members. The fleet keeps a ledger and **no one borrows
+without giving**:
+
+- **Giving** = serving a job. The host's "Run" jobs and other workers' borrows
+  both count as jobs a node completes.
+- **Borrowing** = requesting a job. Any worker can ask the fleet for compute
+  (`job` → the host routes it to a ready giver, tokens stream back).
+- **Credit = gave − took.** A node may only borrow while its credit is above
+  zero, so a new node must serve compute before it can take any. The host
+  enforces this at the router, and the credit number is broadcast back to each
+  node so the meter is visible.
+- **The host gives too.** "Lend my device" loads a model in the host's own tab
+  and makes it a giver, so the host earns credit back to the fleet instead of
+  only drawing from it.
+
 ## Also get the fold up and running
 
 The same page that hands out the compute link doubles as the fold's door:
@@ -102,6 +119,6 @@ npm run dev
 ## Next steps
 
 - TURN (coturn) for NAT traversal, fleet scaling.
-- Mesh routing between workers, job queue with model/worker affinity.
+- Mesh routing between workers (today borrows route through the host), job queue with model/worker affinity.
 - The fold — this page is already its door; the same accept-link can later
   bind a fold instance to a fleet room.
