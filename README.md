@@ -23,7 +23,8 @@ central server.
 1. Open the deployed site. Enter the name you want workers to see, click **Create fleet room**.
 2. Copy the share link — it names you (your Matrix id + display name), carries an expiry, and sends it to anyone.
 3. They open it and see **who is asking**, their own **public IP**, and the invite's remaining time.
-4. You tell them the invite code out-of-band; they enter it, press **Accept compute duties**, pick a model size.
+4. You tell them the 6-digit code (not in the link); they enter it, the code is
+   confirmed by you live, they press **Accept compute duties**, pick a model size.
 5. Back on your screen they appear under **Workers**, with a countdown on their lease.
 
 Every device that presses accept auto-creates a throwaway Matrix account on
@@ -41,11 +42,12 @@ The handshake is consent-first, and everything is time-bound:
   the worker sees a hard warning.
 - **Their own exposure.** Before accepting, the worker is shown its own public
   IP and told that the host will see that IP and the device type once connected.
-- **A secret code.** Every invite has a one-time secret code. The link carries
-  only the code's SHA-256 hash; the host shares the code itself out-of-band.
-  Accepting requires entering the code, so a stolen link alone cannot make a
-  device compute for anyone — the worker verifies the code locally and never
-  transmits it.
+- **A 6-digit secret code, 2FA style.** Every invite has a code the host
+  generates and shares out-of-band (voice, chat, in person). The code never
+  rides in the link, and accepting requires it: the worker sends only a hash of
+  the code over the encrypted channel and the host confirms it live. A stolen
+  link alone is worthless, and the host refuses wrong codes. A device that the
+  host has confirmed once is remembered, so lease renewals don't re-ask.
 - **Accounts.** Each device auto-creates its own account on hyphae.social, and
   a device that's already signed in reuses its own session. Crypto state is
   stored per account in IndexedDB (scoped via `cryptoDatabasePrefix`), so

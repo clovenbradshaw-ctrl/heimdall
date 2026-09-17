@@ -20,13 +20,10 @@ const NAME_KEY = "heimdall.name.v1";
 
 const INVITE_TTL = 7 * 24 * 3600 * 1000; // a share link is good for 7 days
 const LEASE_TTL = 12 * 3600 * 1000; // an accepted lease lasts 12h, then must be renewed
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"; // no 0/O/1/I/L
 
 function makeSecretCode() {
-  const bytes = crypto.getRandomValues(new Uint8Array(8));
-  let chars = "";
-  for (const b of bytes) chars += CODE_ALPHABET[b % CODE_ALPHABET.length];
-  return `${chars.slice(0, 4)}-${chars.slice(4)}`;
+  const bytes = crypto.getRandomValues(new Uint32Array(1))[0];
+  return String(100000 + (bytes % 900000));
 }
 
 const FOLD_REPO = "https://github.com/clovenbradshaw-ctrl/the-fold.git";
@@ -59,6 +56,7 @@ const app = {
   renewRequested: false,
   myIp: null,
   timers: [],
+  pendingVerify: null,
   ledger: new Map(), // deviceKey -> { give, borrow }
   relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec }
   giverIdx: 0,
@@ -141,6 +139,32 @@ function onSignal(senderUserId, content) {
     }
   } else if (content.type === "ready" && mode === "controller") {
     reconcile();
+  } else if (content.type === "verify" && mode === "controller") {
+    // A worker is presenting the 6-digit code. The code never rides in the
+    // link and never travels to us in the clear — the worker sends only its
+    // hash, and WE confirm it. That makes acceptance a live two-party consent
+    // exchange instead of a hash embedded in a URL.
+    const ok = app.secret && content.codeHash === app.secret.hash;
+    const device = { userId: senderUserId, deviceId: content.deviceId };
+    app.matrix
+      ?.sendSignalRetry(device, { type: ok ? "verified" : "denied", deviceId: app.matrix.deviceId }, 3)
+      .then(() => {});
+    if (ok) toast(`invite code confirmed for ${senderUserId}`);
+    else toast(`someone entered the wrong code: ${senderUserId}`);
+  } else if (content.type === "verified" && mode === "worker") {
+    if (app.creatorId && senderUserId !== app.creatorId) return;
+    if (app.pendingVerify) {
+      const r = app.pendingVerify;
+      app.pendingVerify = null;
+      r(true);
+    }
+  } else if (content.type === "denied" && mode === "worker") {
+    if (app.creatorId && senderUserId !== app.creatorId) return;
+    if (app.pendingVerify) {
+      const r = app.pendingVerify;
+      app.pendingVerify = null;
+      r(false);
+    }
   }
 }
 
@@ -156,9 +180,16 @@ async function buildInviteUrl() {
   app.invite = { name, exp };
   saveSession({ invite: { name, exp, code: app.secret.code, codeHash: app.secret.hash } });
   const base = shareUrl(app.roomId, app.hs);
-  // Only the hash of the code rides in the link. The code itself is shared
-  // out-of-band, so a stolen link alone can't make a device compute for anyone.
-  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}&c=${app.secret.hash}`;
+  // The code itself never rides in the link — acceptance is confirmed live by
+  // the host (see onSignal "verify"). A stolen link is worthless on its own.
+  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}`;
+}
+
+async function renewInvite() {
+  // Rotate the secret too: a fresh link with a fresh code is renewed consent.
+  app.secret = null;
+  await refreshShareBox();
+  toast("new link + new invite code issued");
 }
 
 async function refreshShareBox() {
@@ -461,16 +492,18 @@ async function acceptDuty() {
     toast(`this invite expired — ask ${share.name || "the host"} for a fresh link`);
     return;
   }
-  if (!share.codeHash) {
-    toast("this link carries no secret — ask the host for a fresh invite with a code");
-    return;
-  }
-  const code = (codeEl?.value || "").trim().toUpperCase().replace(/\s+/g, "");
-  const ok = (await sha256Hex(code)) === share.codeHash;
-  if (!ok) {
-    toast("invite code doesn't match — check with the host");
-    codeEl.focus();
-    return;
+  // A 6-digit code the host gives you out-of-band, 2FA style. It never rides
+  // in the link; the host confirms it live over the encrypted channel. A
+  // stolen link is worthless without the code AND the host's confirmation.
+  const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
+  if (!verifiedFlag) {
+    const code = (codeEl?.value || "").trim();
+    if (!/^\d{6}$/.test(code)) {
+      toast("enter the 6-digit invite code the host gave you");
+      codeEl?.focus();
+      return;
+    }
+    app.enteredCode = code;
   }
   acceptBtnEl.disabled = true;
   acceptBtnEl.textContent = "Joining…";
@@ -479,6 +512,30 @@ async function acceptDuty() {
     await matrix.joinRoom(app.roomId);
     app.creatorId = matrix.roomCreator();
     renderIdentity();
+
+    // Hard consent gate: the identity claimed on the link must actually own
+    // the room. Otherwise a forged link+code could route a device into a
+    // stranger's fleet while impersonating the intended host.
+    if (share.host && app.creatorId !== share.host) {
+      reenableAccept();
+      statusEl.textContent = `blocked: the room belongs to ${app.creatorId}, not ${share.host}`;
+      toast("refused — this link impersonates the host");
+      return;
+    }
+
+    if (!verifiedFlag) {
+      // Present the code to the host and wait for their confirmation.
+      const codeHash = await sha256Hex(app.enteredCode);
+      const confirmed = await hostConfirmCode(matrix, codeHash);
+      if (!confirmed) {
+        reenableAccept();
+        statusEl.textContent = "blocked: the host didn't confirm your code";
+        toast("the host didn't confirm your code — they may be offline, or the code is wrong");
+        return;
+      }
+      // Confirmed once by the host on this device → lease renewals don't re-ask.
+      localStorage.setItem(`heimdall.verified.${app.roomId}`, "1");
+    }
 
     statusEl.textContent = "Loading model…";
     if (app.engine === null) {
@@ -513,11 +570,48 @@ async function acceptDuty() {
     renderWorkerStatus();
     toast("you are compute now. keep this tab open.");
   } catch (e) {
-    acceptBtnEl.disabled = false;
-    acceptBtnEl.textContent = "Accept compute duties";
+    reenableAccept();
     statusEl.textContent = `failed: ${e.message}`;
     toast(`accept failed: ${e.message}`);
   }
+}
+
+function reenableAccept() {
+  acceptBtnEl.disabled = false;
+  acceptBtnEl.textContent = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1"
+    ? "Renew compute duties"
+    : "Accept compute duties";
+}
+
+/** Send the code hash to the host and wait for their live confirmation. */
+function hostConfirmCode(matrix, codeHash) {
+  return new Promise((resolve) => {
+    app.pendingVerify = resolve;
+    const timer = setTimeout(() => {
+      if (app.pendingVerify) {
+        app.pendingVerify = null;
+        resolve(false);
+      }
+    }, 25000);
+    matrix
+      .devicesOf(app.creatorId, { retry: 3 })
+      .then((devs) => {
+        if (!devs.length) {
+          clearTimeout(timer);
+          app.pendingVerify = null;
+          resolve(false);
+          return;
+        }
+        for (const d of devs) {
+          matrix.sendSignalRetry(d, { type: "verify", deviceId: matrix.deviceId, codeHash }, 3).catch(() => {});
+        }
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        app.pendingVerify = null;
+        resolve(false);
+      });
+  });
 }
 
 async function announceReady() {
@@ -734,10 +828,10 @@ function controllerView() {
   const shareRow = el("div", { class: "linkbox" }, [
     shareBoxEl,
     copyBtn("copy", () => shareBoxEl.value),
-    el("button", { class: "ghost small", text: "renew link", onclick: refreshShareBox }),
+    el("button", { class: "ghost small", text: "renew link + code", onclick: renewInvite }),
   ]);
   const codeRow = el("div", { class: "row" }, [
-    el("span", { class: "muted small", text: "invite code (tell them this separately, never in the link):" }),
+    el("span", { class: "muted small", text: "invite code — your token of invitation. Tell them this separately, never in the link:" }),
     secretCodeEl,
     copyBtn("copy", () => app.secret?.code || ""),
   ]);
@@ -870,17 +964,22 @@ function workerView() {
     localStorage.setItem(MODEL_KEY, app.modelId);
   });
 
+  const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
   codeEl = el("input", {
-    placeholder: "ABCD-EFGH",
-    autocapitalize: "characters",
+    placeholder: "6-digit code",
+    inputmode: "numeric",
     autocomplete: "off",
     oninput: (e) => {
-      e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 9);
+      e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6);
     },
   });
 
   const acceptCard = el("div", { class: "card" });
-  acceptBtnEl = el("button", { class: "primary big", text: "Accept compute duties", onclick: acceptDuty });
+  acceptBtnEl = el("button", {
+    class: "primary big",
+    text: verifiedFlag ? "Renew compute duties" : "Accept compute duties",
+    onclick: acceptDuty,
+  });
   progressEl = el("div", { class: "progress", hidden: true });
   progressFillEl = el("div");
   progressEl.append(progressFillEl);
@@ -890,10 +989,10 @@ function workerView() {
     text: share.exp ? `this invite ${countdownText(share.exp)}` : "no expiry set on this link — treat it with care",
   });
   const codeLine = el("div", {
-    class: "alert " + (share.codeHash ? "warn" : "err"),
-    text: share.codeHash
-      ? "The link only proves who asked — the host gives you the invite code separately. A stolen link alone can't make your device compute for anyone."
-      : "This link carries no secret code — do not accept it. Ask the host for a fresh invite.",
+    class: "alert warn",
+    text: verifiedFlag
+      ? "This device is already confirmed for this room — renewals skip the code."
+      : "Ask the host for their 6-digit invite code. The code is never in the link and is confirmed live by the host, so a stolen link alone can't make your device compute for anyone.",
   });
 
   acceptCard.append(
@@ -909,7 +1008,7 @@ function workerView() {
     ]),
     el("div", { style: "height:10px" }),
     codeLine,
-    el("label", { text: "invite code (required)" }),
+    el("label", { text: verifiedFlag ? "already verified" : "6-digit invite code (required)" }),
     codeEl,
     el("div", { style: "height:10px" }),
     acceptBtnEl,
