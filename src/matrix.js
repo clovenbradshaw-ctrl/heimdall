@@ -1,0 +1,235 @@
+import {
+  createClient,
+  ClientEvent,
+  KnownMembership,
+  RoomEvent,
+  RoomStateEvent,
+} from "matrix-js-sdk";
+
+export const SIGNAL_TYPE = "org.heimdall.signal";
+
+export function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+export function deviceKey(d) {
+  return `${d.userId}|${d.deviceId}`;
+}
+
+/**
+ * Thin wrapper around matrix-js-sdk that gives us:
+ *  - a Matrix account (login or register) on any homeserver
+ *  - one room per fleet, used ONLY as a directory of members
+ *  - encrypted to-device messages for WebRTC signaling.
+ *
+ * Nothing about the actual inference payload ever touches the room:
+ * that all flows over the WebRTC DataChannel.
+ */
+export class MatrixPeer {
+  constructor({ baseUrl, userId, accessToken, deviceId, onSignal, onSync, onMembers }) {
+    this.baseUrl = baseUrl;
+    this.userId = userId;
+    this.deviceId = deviceId;
+    this.roomId = null;
+    this.onSignal = onSignal || (() => {});
+    this.onSync = onSync || (() => {});
+    this.onMembers = onMembers || (() => {});
+
+    this.client = createClient({ baseUrl, userId, accessToken, deviceId });
+
+    this.client.on(ClientEvent.Sync, (state) => {
+      if (state === "PREPARED") this.onSync();
+    });
+    // Encrypted to-device events are decrypted for us; the type is the
+    // original (our SIGNAL_TYPE) and the content is our payload.
+    this.client.on(ClientEvent.ToDeviceEvent, (event) => {
+      if (event.getType() !== SIGNAL_TYPE) return;
+      this.onSignal(event.getSender(), event.getContent());
+    });
+    this.client.on(RoomStateEvent.Members, (event, state) => {
+      if (state.roomId === this.roomId) this.onMembers();
+    });
+    this.client.on(RoomEvent.MyMembership, (room, membership) => {
+      if (membership === KnownMembership.Join) this.onMembers();
+    });
+  }
+
+  async start() {
+    await this.client.initRustCrypto();
+    await this.client.startClient({ initialSyncLimit: 0 });
+  }
+
+  async createFleetRoom() {
+    const res = await this.client.createRoom({
+      name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
+      preset: "public_chat",
+      visibility: "private",
+    });
+    this.roomId = res.room_id;
+    return this.roomId;
+  }
+
+  async joinRoom(roomId) {
+    this.roomId = roomId;
+    await this.client.joinRoom(roomId);
+    return this.roomId;
+  }
+
+  roomMembers() {
+    const room = this.client.getRoom(this.roomId);
+    if (!room) return [];
+    return room
+      .getJoinedMembers()
+      .map((m) => m.userId)
+      .filter((id) => id !== this.userId);
+  }
+
+  roomCreator() {
+    const room = this.client.getRoom(this.roomId);
+    const create = room?.currentState?.getStateEvents("m.room.create")?.[0];
+    return create ? create.getSender() : null;
+  }
+
+  /**
+   * Discover the E2EE-capable devices of a user. Retries because the
+   * freshly-joined worker needs a sync cycle to upload its keys first.
+   */
+  async devicesOf(userId, { retry = 0 } = {}) {
+    const read = () =>
+      this.client
+        .getStoredDevicesForUser(userId)
+        .map((d) => ({ userId, deviceId: String(d.deviceId) }));
+    let attempts = 0;
+    while (true) {
+      let devs = read();
+      if (devs.length) return devs;
+      try {
+        await this.client.downloadKeys([userId]);
+      } catch {
+        /* user or device list not known yet */
+      }
+      devs = read();
+      if (devs.length) return devs;
+      if (attempts >= retry) return [];
+      attempts++;
+      await sleep(2500);
+    }
+  }
+
+  async sendSignal(device, content) {
+    await this.client.encryptAndSendToDevice(
+      SIGNAL_TYPE,
+      [{ userId: device.userId, deviceId: device.deviceId }],
+      content,
+    );
+  }
+
+  /** Encrypted to-device, with backoff. Olm sessions may not exist yet. */
+  async sendSignalRetry(device, content, attempts = 5) {
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        await this.sendSignal(device, content);
+        return true;
+      } catch {
+        if (i === attempts) return false;
+        await sleep(2000 * i);
+      }
+    }
+    return false;
+  }
+
+  stop() {
+    this.client.stopClient();
+  }
+}
+
+export async function login({ baseUrl, username, password }) {
+  const tmp = createClient({ baseUrl });
+  const res = await tmp.login("m.login.password", {
+    identifier: { type: "m.id.user", user: username },
+    password,
+    initial_device_display_name: "heimdall",
+  });
+  return {
+    baseUrl,
+    userId: res.user_id,
+    accessToken: res.access_token,
+    deviceId: String(res.device_id),
+  };
+}
+
+export async function register({ baseUrl, username, password }) {
+  const tmp = createClient({ baseUrl });
+  const res = await tmp.registerRequest(username, password, undefined, {
+    initial_device_display_name: "heimdall",
+  });
+  if (!res?.access_token) throw new Error("registration incomplete");
+  return {
+    baseUrl,
+    userId: res.user_id,
+    accessToken: res.access_token,
+    deviceId: String(res.device_id),
+  };
+}
+
+/**
+ * Auto-provision a Matrix account on a homeserver with open registration.
+ * Handles the `m.login.dummy` UIA stage automatically (no captcha/email),
+ * which is what self-hosted servers like hyphae.social use. Throws if the
+ * server demands other stages — callers can fall back to a login form.
+ */
+export async function registerAuto({ baseUrl, username, password }) {
+  const url = `${baseUrl}/_matrix/client/v3/register?kind=user`;
+  const body = {
+    username,
+    password,
+    initial_device_display_name: "heimdall",
+  };
+  const post = async (payload) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return { status: res.status, data: await res.json() };
+  };
+
+  let { status, data } = await post(body);
+  if (status === 429) throw new Error("homeserver rate limited account creation; wait a moment");
+  if (data.session && Array.isArray(data.flows)) {
+    const dummy = data.flows.some((f) => f.stages.includes("m.login.dummy"));
+    if (!dummy) throw new Error(`registration requires ${JSON.stringify(data.flows.map((f) => f.stages))}`);
+    ({ status, data } = await post({ ...body, auth: { type: "m.login.dummy", session: data.session } }));
+  }
+  if (!data.access_token) throw new Error(`registration failed: ${JSON.stringify(data)}`);
+  return {
+    baseUrl,
+    userId: data.user_id,
+    accessToken: data.access_token,
+    deviceId: String(data.device_id),
+  };
+}
+
+export function randomUsername(prefix = "heimdall") {
+  const hex = crypto.getRandomValues(new Uint8Array(4)).join("");
+  return `${prefix}-${hex}`;
+}
+
+export function shareUrl(roomId, baseUrl) {
+  const here = `${location.origin}${location.pathname}`;
+  return `${here}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}`;
+}
+
+export function parseShareUrl() {
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room");
+  const hs = params.get("hs");
+  if (!room || !hs) return null;
+  return {
+    roomId: room,
+    baseUrl: hs,
+    host: params.get("host") || "",
+    name: params.get("name") || "",
+    exp: Number(params.get("exp")) || 0,
+  };
+}
