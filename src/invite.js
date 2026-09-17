@@ -2,6 +2,7 @@ import { createClient } from "matrix-js-sdk";
 import { registerAuto, randomUsername, sha256Hex, getAccountData, setAccountData } from "./matrix.js";
 
 export const CODE_TYPE = "org.heimdall.codes";
+export const KEYS_TYPE = "org.heimdall.keys";
 export const INVITE_TTL = 7 * 24 * 3600 * 1000;
 
 export function makeSecretCode() {
@@ -12,6 +13,75 @@ export function makeSecretCode() {
 export function randomPassword() {
   const bytes = crypto.getRandomValues(new Uint8Array(18));
   return btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, "x");
+}
+
+/* ----------------------------------------------------- device keypair crypto
+   Every device has an ECDSA keypair. The 6-digit pairing code is NOT random:
+   it is a short fingerprint of the device's PUBLIC KEY, and accepting requires
+   a signature by the matching PRIVATE KEY. So the code is a commitment — a
+   fake worker cannot present a recorded code without a keypair whose public
+   key fingerprints to it and whose private key they hold. */
+
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function b64ToBuf(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+export async function generateDeviceKeyPair() {
+  const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const spki = await crypto.subtle.exportKey("spki", kp.publicKey);
+  const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+  return { pubB64: bufToB64(spki), privJwk: jwk, publicKey: kp.publicKey, privateKey: kp.privateKey };
+}
+
+export async function importPublicKeyB64(pubB64) {
+  return crypto.subtle.importKey("spki", b64ToBuf(pubB64), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+}
+
+export async function importPrivateKeyJwk(jwk) {
+  return crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+}
+
+export async function signText(privateKey, text) {
+  const sig = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    privateKey,
+    new TextEncoder().encode(text),
+  );
+  return bufToB64(sig);
+}
+
+export async function verifyText(publicKey, text, sigB64) {
+  try {
+    return await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      publicKey,
+      b64ToBuf(sigB64),
+      new TextEncoder().encode(text),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The 6-digit pairing code = a short fingerprint of the device's public key. */
+export async function codeFromPublicKey(pubB64) {
+  const h = await sha256Hex(pubB64);
+  return String(100000 + (parseInt(h.slice(0, 6), 16) % 900000));
+}
+
+/** The exact string a worker signs, binding key → code → room → identity. */
+export function pairingPayload(roomId, userId, deviceId, codeHash) {
+  return `heimdall|${roomId}|${userId}|${deviceId}|${codeHash}`;
 }
 
 export function buildInviteUrl({ site, roomId, baseUrl, host, name, exp }) {
@@ -26,7 +96,7 @@ export async function ensureControllerSession({ baseUrl, creds }) {
   return { ...c, password };
 }
 
-/** Record an issued code on the account so any surface can confirm it. */
+/** Record an issued/onboarded code on the account so any surface can confirm it. */
 export async function issueCode({ creds, code, exp }) {
   const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
@@ -35,20 +105,41 @@ export async function issueCode({ creds, code, exp }) {
   return true;
 }
 
-/** Ask the account whether a presented code hash is one it issued. */
+/** Ask the account whether a presented code hash is one it recorded. */
 export async function confirmCode({ creds, codeHash }) {
   const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
   return active.some((c) => c.hash === codeHash);
 }
 
+/** Drop a used code from the registry so it can't be reused by another device. */
+export async function consumeCode({ creds, codeHash }) {
+  const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
+  const active = (reg?.active || []).filter((c) => c.exp > Date.now() && c.hash !== codeHash);
+  await setAccountData({ ...creds, type: CODE_TYPE, content: { active } }).catch(() => {});
+}
+
+/** Remember which device public key owns a userId|deviceId after pairing. */
+export async function recordPairedKey({ creds, userId, deviceId, pubKey }) {
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && k.deviceId === deviceId));
+  paired.push({ userId, deviceId, pubKey, at: Date.now() });
+  await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
+}
+
+export async function pairedKeyFor({ creds, userId, deviceId }) {
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  return (reg?.paired || []).find((k) => k.userId === userId && k.deviceId === deviceId) || null;
+}
+
 /**
  * The one function every surface uses to mint an invite:
  *  - ensures a controller account (or reuses the provided one),
  *  - creates (or reuses) a fleet room,
- *  - generates a 6-digit code, records it on the account,
- *  - returns the share link and the code.
- * Works in the browser and in Node (CLI / fold).
+ *  - returns the share link.
+ * The 6-digit pairing code is generated on the WORKER's device and given to
+ * the host out of band; the host records it (issueCode) to onboard that
+ * worker. Works in the browser and in Node (CLI / fold).
  */
 export async function createInvite({ baseUrl, creds, roomId, displayName, site }) {
   creds = await ensureControllerSession({ baseUrl, creds });
@@ -66,13 +157,10 @@ export async function createInvite({ baseUrl, creds, roomId, displayName, site }
     });
     roomId = room.room_id;
   }
-  const code = makeSecretCode();
   const exp = Date.now() + INVITE_TTL;
   const name = displayName || creds.userId;
-  await issueCode({ creds, code, exp });
   return {
     url: buildInviteUrl({ site, roomId, baseUrl, host: creds.userId, name, exp }),
-    code,
     exp,
     roomId,
     creds,

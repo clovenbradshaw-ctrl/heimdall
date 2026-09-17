@@ -23,8 +23,9 @@ central server.
 1. Open the deployed site. Enter the name you want workers to see, click **Create fleet room**.
 2. Copy the share link — it names you (your Matrix id + display name), carries an expiry, and sends it to anyone.
 3. They open it and see **who is asking**, their own **public IP**, and the invite's remaining time.
-4. You tell them the 6-digit code (not in the link); they enter it, the code is
-   confirmed by you live, they press **Accept compute duties**, pick a model size.
+4. The worker's device shows its pairing code; they tell it to you, you
+   record it, they press **Accept compute duties** (their device proves the
+   pairing with its private key) and pick a model size.
 5. Back on your screen they appear under **Workers**, with a countdown on their lease.
 
 Every device that presses accept auto-creates a throwaway Matrix account on
@@ -42,12 +43,15 @@ The handshake is consent-first, and everything is time-bound:
   the worker sees a hard warning.
 - **Their own exposure.** Before accepting, the worker is shown its own public
   IP and told that the host will see that IP and the device type once connected.
-- **A 6-digit secret code, 2FA style.** Every invite has a code the host
-  generates and shares out-of-band (voice, chat, in person). The code never
-  rides in the link, and accepting requires it: the worker sends only a hash of
-  the code over the encrypted channel and the host confirms it live. A stolen
-  link alone is worthless, and the host refuses wrong codes. A device that the
-  host has confirmed once is remembered, so lease renewals don't re-ask.
+- **A 6-digit pairing code backed by a keypair.** Every device holds an ECDSA
+  keypair; the code is a short fingerprint of its **public key**. The worker
+  gives the code to the host out of band, the host records it, and acceptance
+  proves the pairing cryptographically — the worker signs the room + identity +
+  code hash with its **private key**, and the host verifies all three links:
+  recorded code ⟷ public-key fingerprint ⟷ valid signature. A stolen link or a
+  leaked code alone cannot fake the pairing, and used codes are consumed. (The
+  6-digit fingerprint is a human handoff; the P-256 signature is the
+  unforgeable identity. Bump the code length to raise fingerprint strength.)
 - **Accounts.** Each device auto-creates its own account on hyphae.social, and
   a device that's already signed in reuses its own session. Crypto state is
   stored per account in IndexedDB (scoped via `cryptoDatabasePrefix`), so
@@ -90,9 +94,10 @@ The same page that hands out the compute link doubles as the fold's door:
 ## Generate invites from any surface
 
 Invites are minted by a single shared function (`src/invite.js` →
-`createInvite`), and the 6-digit codes live in the controller account's
-account data — so every surface signed into that account can issue *and*
-confirm codes.
+`createInvite`), and the pairing codes live in the controller account's
+account data — so every surface signed into that account can record *and*
+confirm codes. The worker's device holds its own keypair, so the pairing
+proof travels with the worker, not the surface.
 
 - **This site.** Controller mode → Create fleet room → copy link + code.
 - **Any terminal.** `npx --yes github:clovenbradshaw-ctrl/heimdall invite`

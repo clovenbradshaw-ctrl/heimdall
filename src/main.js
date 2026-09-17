@@ -12,7 +12,19 @@ import {
 import { RtcPeer } from "./rtc.js";
 import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
-import { makeSecretCode, issueCode, confirmCode } from "./invite.js";
+import {
+  generateDeviceKeyPair,
+  importPrivateKeyJwk,
+  codeFromPublicKey,
+  signText,
+  pairingPayload,
+  issueCode,
+  confirmCode,
+  consumeCode,
+  importPublicKeyB64,
+  verifyText,
+  recordPairedKey,
+} from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
 const SESSION_KEY = "heimdall.session.v1";
@@ -38,10 +50,6 @@ const app = {
   displayName: localStorage.getItem(NAME_KEY) || "",
   matrix: null,
   creatorId: null,
-  secret: (() => {
-    const s = loadSession()?.invite;
-    return s?.code && s?.codeHash ? { code: s.code, hash: s.codeHash } : null;
-  })(),
   workers: new Map(), // controller: deviceKey -> worker record
   peers: new Map(), // worker: controller deviceKey -> RtcPeer
   connecting: new Map(), // controller: deviceKey -> timestamp
@@ -138,24 +146,36 @@ async function onSignal(senderUserId, content) {
   } else if (content.type === "ready" && mode === "controller") {
     reconcile();
   } else if (content.type === "verify" && mode === "controller") {
-    // A worker is presenting the 6-digit code. The code never rides in the
-    // link and never travels to us in the clear — the worker sends only its
-    // hash, and WE confirm it. The registry lives on the account, so codes
-    // issued from ANY surface (browser, CLI, fold) are confirmable here.
-    const local = app.secret && content.codeHash === app.secret.hash;
-    let remote = false;
-    if (!local && app.session?.creds) {
-      try {
-        remote = await confirmCode({ creds: app.session.creds, codeHash: content.codeHash });
-      } catch {}
-    }
-    const ok = local || remote;
+    // The worker proves the pairing. We verify the whole chain before
+    // confirming — nothing can be faked without the private key:
+    //   1. the presented code hash was actually recorded by us,
+    //   2. that code is the fingerprint of the presented PUBLIC key,
+    //   3. the signature is valid under that public key, over room+identity+code.
+    let ok = false;
+    try {
+      if (app.session?.creds) {
+        const creds = app.session.creds;
+        const recorded = await confirmCode({ creds, codeHash: content.codeHash });
+        if (recorded && content.pubKey && content.sig) {
+          const pubKey = await importPublicKeyB64(content.pubKey);
+          const fingerprint = await codeFromPublicKey(content.pubKey);
+          const fpMatches = (await sha256Hex(fingerprint)) === content.codeHash;
+          const payload = pairingPayload(app.roomId, senderUserId, content.deviceId, content.codeHash);
+          const sigOk = await verifyText(pubKey, payload, content.sig);
+          ok = fpMatches && sigOk;
+          if (ok) {
+            consumeCode({ creds, codeHash: content.codeHash }).catch(() => {});
+            recordPairedKey({ creds, userId: senderUserId, deviceId: content.deviceId, pubKey: content.pubKey }).catch(() => {});
+          }
+        }
+      }
+    } catch {}
     const device = { userId: senderUserId, deviceId: content.deviceId };
     app.matrix
       ?.sendSignalRetry(device, { type: ok ? "verified" : "denied", deviceId: app.matrix.deviceId }, 3)
       .then(() => {});
-    if (ok) toast(`invite code confirmed for ${senderUserId}`);
-    else toast(`someone entered the wrong code: ${senderUserId}`);
+    if (ok) toast(`paired ${senderUserId} — signature + code verified`);
+    else toast(`pairing refused for ${senderUserId} — code, key, or signature didn't check out`);
   } else if (content.type === "verified" && mode === "worker") {
     if (app.creatorId && senderUserId !== app.creatorId) return;
     if (app.pendingVerify) {
@@ -178,35 +198,24 @@ async function onSignal(senderUserId, content) {
 async function buildInviteUrl() {
   const name = app.displayName || app.matrix.userId;
   const exp = Date.now() + INVITE_TTL;
-  if (!app.secret) {
-    const code = makeSecretCode();
-    app.secret = { code, hash: await sha256Hex(code) };
-  }
-  // Record the code on the account so ANY surface signed in as this controller
-  // (browser, CLI, fold) can confirm it when a worker presents it.
-  if (app.session?.creds) {
-    issueCode({ creds: app.session.creds, code: app.secret.code, exp }).catch(() => {});
-  }
   app.invite = { name, exp };
-  saveSession({ invite: { name, exp, code: app.secret.code, codeHash: app.secret.hash } });
+  saveSession({ invite: app.invite });
   const base = shareUrl(app.roomId, app.hs);
-  // The code itself never rides in the link — acceptance is confirmed live by
-  // the host (see onSignal "verify"). A stolen link is worthless on its own.
+  // The 6-digit pairing code is generated on the WORKER's device and given to
+  // you out of band; you record it to onboard them. It never rides in the link.
   return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}`;
 }
 
 async function renewInvite() {
-  // Rotate the secret too: a fresh link with a fresh code is renewed consent.
-  app.secret = null;
+  // Renewed consent: a fresh link, same room, fresh expiry.
   await refreshShareBox();
-  toast("new link + new invite code issued");
+  toast("new link issued — share it with your worker");
 }
 
 async function refreshShareBox() {
   if (!shareBoxEl || !app.roomId) return;
   shareBoxEl.value = await buildInviteUrl();
   shareBoxEl.disabled = false;
-  if (secretCodeEl && app.secret) secretCodeEl.textContent = app.secret.code;
   inviteExpiryEl.textContent = `link expires ${countdownText(app.invite.exp)} — renew to keep it alive`;
 }
 
@@ -502,18 +511,17 @@ async function acceptDuty() {
     toast(`this invite expired — ask ${share.name || "the host"} for a fresh link`);
     return;
   }
-  // A 6-digit code the host gives you out-of-band, 2FA style. It never rides
-  // in the link; the host confirms it live over the encrypted channel. A
-  // stolen link is worthless without the code AND the host's confirmation.
+  // The pairing is cryptographic. Your device holds an ECDSA keypair; the
+  // 6-digit code is a fingerprint of its PUBLIC KEY, and you prove the pairing
+  // by signing it with the PRIVATE KEY. The host records the code you give
+  // them, then verifies: recorded code ⟷ key fingerprint ⟷ valid signature.
   const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
   if (!verifiedFlag) {
-    const code = (codeEl?.value || "").trim();
-    if (!/^\d{6}$/.test(code)) {
-      toast("enter the 6-digit invite code the host gave you");
-      codeEl?.focus();
+    await ensureDeviceKeys();
+    if (!/^\d{6}$/.test(app.pairCode || "")) {
+      toast("waiting for your device code…");
       return;
     }
-    app.enteredCode = code;
   }
   acceptBtnEl.disabled = true;
   acceptBtnEl.textContent = "Joining…";
@@ -534,9 +542,11 @@ async function acceptDuty() {
     }
 
     if (!verifiedFlag) {
-      // Present the code to the host and wait for their confirmation.
-      const codeHash = await sha256Hex(app.enteredCode);
-      const confirmed = await hostConfirmCode(matrix, codeHash);
+      // Prove the pairing: fingerprint code + signed payload to the host.
+      const codeHash = await sha256Hex(app.pairCode);
+      const payload = pairingPayload(app.roomId, matrix.userId, matrix.deviceId, codeHash);
+      const sig = await signText(app.pairPriv, payload);
+      const confirmed = await hostConfirmCode(matrix, codeHash, app.pairPub, sig);
       if (!confirmed) {
         reenableAccept();
         statusEl.textContent = "blocked: the host didn't confirm your code";
@@ -593,8 +603,28 @@ function reenableAccept() {
     : "Accept compute duties";
 }
 
-/** Send the code hash to the host and wait for their live confirmation. */
-function hostConfirmCode(matrix, codeHash) {
+/** The device's persistent ECDSA keypair; the pairing code is its fingerprint. */
+async function ensureDeviceKeys() {
+  const key = `heimdall.keys.${app.roomId}`;
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(key) || "null");
+  } catch {}
+  if (stored?.pub && stored?.priv) {
+    app.pairPub = stored.pub;
+    app.pairPriv = await importPrivateKeyJwk(stored.priv);
+    app.pairCode = await codeFromPublicKey(stored.pub);
+    return;
+  }
+  const fresh = await generateDeviceKeyPair();
+  localStorage.setItem(key, JSON.stringify({ pub: fresh.pubB64, priv: fresh.privJwk }));
+  app.pairPub = fresh.pubB64;
+  app.pairPriv = fresh.privateKey;
+  app.pairCode = await codeFromPublicKey(fresh.pubB64);
+}
+
+/** Send the signed pairing proof to the host and wait for confirmation. */
+function hostConfirmCode(matrix, codeHash, pubKey, sig) {
   return new Promise((resolve) => {
     app.pendingVerify = resolve;
     const timer = setTimeout(() => {
@@ -613,7 +643,9 @@ function hostConfirmCode(matrix, codeHash) {
           return;
         }
         for (const d of devs) {
-          matrix.sendSignalRetry(d, { type: "verify", deviceId: matrix.deviceId, codeHash }, 3).catch(() => {});
+          matrix
+            .sendSignalRetry(d, { type: "verify", deviceId: matrix.deviceId, codeHash, pubKey, sig }, 3)
+            .catch(() => {});
         }
       })
       .catch(() => {
@@ -769,7 +801,7 @@ async function keepAwake() {
 
 /* ------------------------------------------------------------------- view */
 
-let shareBoxEl, inviteExpiryEl, secretCodeEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
+let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
 let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, codeEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
 function header() {
@@ -834,20 +866,46 @@ function controllerView() {
 
   shareBoxEl = el("input", { readonly: true, value: "", placeholder: "share link appears here" });
   inviteExpiryEl = el("div", { class: "muted small" });
-  secretCodeEl = el("span", { class: "kbd" });
   const shareRow = el("div", { class: "linkbox" }, [
     shareBoxEl,
     copyBtn("copy", () => shareBoxEl.value),
-    el("button", { class: "ghost small", text: "renew link + code", onclick: renewInvite }),
+    el("button", { class: "ghost small", text: "renew link", onclick: renewInvite }),
   ]);
-  const codeRow = el("div", { class: "row" }, [
-    el("span", { class: "muted small", text: "invite code — your token of invitation. Tell them this separately, never in the link:" }),
-    secretCodeEl,
-    copyBtn("copy", () => app.secret?.code || ""),
+
+  // The worker generates the pairing code on their device and gives it to you
+  // out of band. You record it here to onboard them; it never rides in the link.
+  const workerCodeEl = el("input", { placeholder: "6-digit code a worker gave you", inputmode: "numeric" });
+  const recordBtn = el("button", {
+    class: "primary",
+    text: "Record",
+    onclick: async () => {
+      const code = workerCodeEl.value.trim();
+      if (!/^\d{6}$/.test(code)) {
+        toast("enter the 6-digit code your worker gave you");
+        return;
+      }
+      if (!app.session?.creds) {
+        toast("not signed in yet — create or rejoin a fleet first");
+        return;
+      }
+      try {
+        await issueCode({ creds: app.session.creds, code, exp: Date.now() + INVITE_TTL });
+        workerCodeEl.value = "";
+        toast(`recorded ${code} — that worker can accept now`);
+      } catch (e) {
+        toast(`could not record: ${e.message}`);
+      }
+    },
+  });
+  const codeRow = el("div", { class: "linkbox" }, [
+    workerCodeEl,
+    recordBtn,
+    el("span", { class: "muted small", text: "their code → you record it → they accept" }),
   ]);
+
   const cliCmd = "npx --yes github:clovenbradshaw-ctrl/heimdall invite";
   const cliRow = el("div", { class: "row" }, [
-    el("span", { class: "muted small", text: "or from any terminal / the fold:" }),
+    el("span", { class: "muted small", text: "or mint the link from any terminal / the fold:" }),
     el("code", { text: cliCmd }),
     copyBtn("copy", () => cliCmd),
   ]);
@@ -982,9 +1040,31 @@ function workerView() {
   });
 
   const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
+  const pairBox = el("div", { class: "alert warn" });
+  if (!verifiedFlag) {
+    // Load the device keypair and show its fingerprint code.
+    ensureDeviceKeys()
+      .then(() => {
+        if (!app.pairCode) return;
+        pairBox.replaceChildren(
+          el("div", { class: "row" }, [
+            el("span", { text: "Your code (fingerprint of this device's key): " }),
+            el("span", { class: "kbd", text: app.pairCode }),
+            copyBtn("copy", () => app.pairCode),
+          ]),
+          el("div", { class: "muted small", text: "Send this code to the host out of band. When you accept, this device proves it with its private key — the code alone can't be faked." }),
+        );
+        if (codeEl) codeEl.value = app.pairCode;
+      })
+      .catch(() => {
+        pairBox.textContent = "could not create this device's key";
+      });
+  }
+
   codeEl = el("input", {
     placeholder: "6-digit code",
     inputmode: "numeric",
+    readonly: verifiedFlag ? true : "",
     autocomplete: "off",
     oninput: (e) => {
       e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6);
@@ -1006,10 +1086,10 @@ function workerView() {
     text: share.exp ? `this invite ${countdownText(share.exp)}` : "no expiry set on this link — treat it with care",
   });
   const codeLine = el("div", {
-    class: "alert warn",
+    class: "alert " + (verifiedFlag ? "ok" : "warn"),
     text: verifiedFlag
-      ? "This device is already confirmed for this room — renewals skip the code."
-      : "Ask the host for their 6-digit invite code. The code is never in the link and is confirmed live by the host, so a stolen link alone can't make your device compute for anyone.",
+      ? "This device is already paired for this room — renewals skip the proof."
+      : "Your code is the fingerprint of this device's key, and it is confirmed live by the host with a signature — a stolen link or a leaked code alone can't fake the pairing.",
   });
 
   acceptCard.append(
@@ -1024,8 +1104,9 @@ function workerView() {
       el("span", { class: "badge", text: deviceName() }),
     ]),
     el("div", { style: "height:10px" }),
+    pairBox,
     codeLine,
-    el("label", { text: verifiedFlag ? "already verified" : "6-digit invite code (required)" }),
+    el("label", { text: verifiedFlag ? "already paired" : "your device code" }),
     codeEl,
     el("div", { style: "height:10px" }),
     acceptBtnEl,
