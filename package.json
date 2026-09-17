@@ -8,7 +8,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "icons": "node scripts/gen-icons.mjs"
+    "icons": "node scripts/gen-icons.mjs",
+    "invite": "node bin/heimdall.mjs invite"
+  },
+  "bin": {
+    "heimdall": "./bin/heimdall.mjs"
   },
   "dependencies": {
     "@mlc-ai/web-llm": "^0.2.85",

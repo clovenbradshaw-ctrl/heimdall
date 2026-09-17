@@ -87,6 +87,29 @@ The same page that hands out the compute link doubles as the fold's door:
   → opens `http://localhost:8811`. Needs git + Node ≥ 20.11; the script
   installs Ollama (`gemma2:2b`) for you.
 
+## Generate invites from any surface
+
+Invites are minted by a single shared function (`src/invite.js` →
+`createInvite`), and the 6-digit codes live in the controller account's
+account data — so every surface signed into that account can issue *and*
+confirm codes.
+
+- **This site.** Controller mode → Create fleet room → copy link + code.
+- **Any terminal.** `npx --yes github:clovenbradshaw-ctrl/heimdall invite`
+  prints the link and code, and remembers the session in `~/.heimdall/state.json`.
+  Options: `--name "Your Name"`, `--room !id:hs` (reuse a fleet), `--new`,
+  `--user @me:hs --password …` (use your own account), `--hs URL`. Also
+  `heimdall login` and `heimdall reset`. Set `HEIMDALL_SITE` to point at a
+  local dev server.
+- **The fold.** The fold's terminal can run the same command, and any page or
+  script can import `createInvite` (browser or Node) to mint an invite and
+  push the code into the shared registry.
+
+For all surfaces to be one identity: sign in with the **same Matrix account**
+everywhere (`heimdall login --user …` on the CLI, "Sign in with my own account"
+on the site, claim the account to fix a password). Keep the controller site
+open on that account so live code confirmation works when a worker accepts.
+
 ## Deploy
 
 It's a static Vite app. The included GitHub Actions workflow builds it and

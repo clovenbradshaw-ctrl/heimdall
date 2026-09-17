@@ -12,6 +12,7 @@ import {
 import { RtcPeer } from "./rtc.js";
 import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
+import { makeSecretCode, issueCode, confirmCode } from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
 const SESSION_KEY = "heimdall.session.v1";
@@ -20,11 +21,6 @@ const NAME_KEY = "heimdall.name.v1";
 
 const INVITE_TTL = 7 * 24 * 3600 * 1000; // a share link is good for 7 days
 const LEASE_TTL = 12 * 3600 * 1000; // an accepted lease lasts 12h, then must be renewed
-
-function makeSecretCode() {
-  const bytes = crypto.getRandomValues(new Uint32Array(1))[0];
-  return String(100000 + (bytes % 900000));
-}
 
 const FOLD_REPO = "https://github.com/clovenbradshaw-ctrl/the-fold.git";
 const FOLD_WEB = "https://clovenbradshaw-ctrl.github.io/the-fold/";
@@ -99,7 +95,9 @@ async function ensureMatrix() {
   if (!creds) {
     const password = randomBytes();
     creds = await registerAuto({ baseUrl: app.hs, username: randomUsername(), password });
-    saveSession({ creds });
+    // Keep the generated password so the owner can later prove ownership and
+    // claim the account with a real password (see claimCard / doClaim).
+    saveSession({ creds: { ...creds, password } });
   }
   const cryptoPrefix = "heimdall::" + creds.userId.replace(/[^a-zA-Z0-9._-]/g, "_");
   const matrix = new MatrixPeer({
@@ -124,7 +122,7 @@ async function tryLogin({ baseUrl, username, password }) {
 
 /* ------------------------------------------------------------- signaling */
 
-function onSignal(senderUserId, content) {
+async function onSignal(senderUserId, content) {
   if (content.type === "signal") {
     const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
     if (mode === "controller") {
@@ -142,9 +140,16 @@ function onSignal(senderUserId, content) {
   } else if (content.type === "verify" && mode === "controller") {
     // A worker is presenting the 6-digit code. The code never rides in the
     // link and never travels to us in the clear — the worker sends only its
-    // hash, and WE confirm it. That makes acceptance a live two-party consent
-    // exchange instead of a hash embedded in a URL.
-    const ok = app.secret && content.codeHash === app.secret.hash;
+    // hash, and WE confirm it. The registry lives on the account, so codes
+    // issued from ANY surface (browser, CLI, fold) are confirmable here.
+    const local = app.secret && content.codeHash === app.secret.hash;
+    let remote = false;
+    if (!local && app.session?.creds) {
+      try {
+        remote = await confirmCode({ creds: app.session.creds, codeHash: content.codeHash });
+      } catch {}
+    }
+    const ok = local || remote;
     const device = { userId: senderUserId, deviceId: content.deviceId };
     app.matrix
       ?.sendSignalRetry(device, { type: ok ? "verified" : "denied", deviceId: app.matrix.deviceId }, 3)
@@ -176,6 +181,11 @@ async function buildInviteUrl() {
   if (!app.secret) {
     const code = makeSecretCode();
     app.secret = { code, hash: await sha256Hex(code) };
+  }
+  // Record the code on the account so ANY surface signed in as this controller
+  // (browser, CLI, fold) can confirm it when a worker presents it.
+  if (app.session?.creds) {
+    issueCode({ creds: app.session.creds, code: app.secret.code, exp }).catch(() => {});
   }
   app.invite = { name, exp };
   saveSession({ invite: { name, exp, code: app.secret.code, codeHash: app.secret.hash } });
@@ -835,6 +845,12 @@ function controllerView() {
     secretCodeEl,
     copyBtn("copy", () => app.secret?.code || ""),
   ]);
+  const cliCmd = "npx --yes github:clovenbradshaw-ctrl/heimdall invite";
+  const cliRow = el("div", { class: "row" }, [
+    el("span", { class: "muted small", text: "or from any terminal / the fold:" }),
+    el("code", { text: cliCmd }),
+    copyBtn("copy", () => cliCmd),
+  ]);
 
   const createBtn = el("button", {
     class: "primary",
@@ -882,6 +898,7 @@ function controllerView() {
       el("div", { class: "row", style: "" }, [createBtn, freshBtn]),
       shareRow,
       codeRow,
+      cliRow,
       inviteExpiryEl,
     ]),
     fleetCardEl,

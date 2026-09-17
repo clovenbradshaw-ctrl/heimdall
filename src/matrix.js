@@ -285,3 +285,25 @@ export async function sha256Hex(text) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+/* Account-scoped data: the shared code registry lives here so that any
+   surface signed into the controller account (browser, CLI, fold) can issue
+   and confirm invite codes. */
+function apiHeaders(accessToken) {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` };
+}
+
+export async function setAccountData({ baseUrl, accessToken, userId, type, content }) {
+  const url = `${baseUrl}/_matrix/client/v3/user/${encodeURIComponent(userId)}/account_data/${encodeURIComponent(type)}`;
+  const res = await fetch(url, { method: "PUT", headers: apiHeaders(accessToken), body: JSON.stringify(content) });
+  if (!res.ok) throw new Error(`account data failed: ${await res.text()}`);
+  return true;
+}
+
+export async function getAccountData({ baseUrl, accessToken, userId, type }) {
+  const url = `${baseUrl}/_matrix/client/v3/user/${encodeURIComponent(userId)}/account_data/${encodeURIComponent(type)}`;
+  const res = await fetch(url, { headers: apiHeaders(accessToken) });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`account data read failed: ${await res.text()}`);
+  return res.json();
+}
