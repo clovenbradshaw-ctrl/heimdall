@@ -26,10 +26,11 @@ export function deviceKey(d) {
  * that all flows over the WebRTC DataChannel.
  */
 export class MatrixPeer {
-  constructor({ baseUrl, userId, accessToken, deviceId, onSignal, onSync, onMembers }) {
+  constructor({ baseUrl, userId, accessToken, deviceId, cryptoPrefix, onSignal, onSync, onMembers }) {
     this.baseUrl = baseUrl;
     this.userId = userId;
     this.deviceId = deviceId;
+    this.cryptoPrefix = cryptoPrefix;
     this.roomId = null;
     this.onSignal = onSignal || (() => {});
     this.onSync = onSync || (() => {});
@@ -55,7 +56,15 @@ export class MatrixPeer {
   }
 
   async start() {
-    await this.client.initRustCrypto();
+    // Scope the IndexedDB crypto store to this account. The default prefix is
+    // shared by every Matrix app on the same origin, which makes
+    // "the account in the store doesn't match the account in the constructor"
+    // blow up the moment two accounts (or two Matrix apps, like the fold)
+    // touch the same browser. A per-account store means reusing the account
+    // you're already logged in with just works.
+    await this.client.initRustCrypto(
+      this.cryptoPrefix ? { cryptoDatabasePrefix: this.cryptoPrefix } : {},
+    );
     await this.client.startClient({ initialSyncLimit: 0 });
   }
 
@@ -215,6 +224,43 @@ export function randomUsername(prefix = "heimdall") {
   return `${prefix}-${hex}`;
 }
 
+/**
+ * Claim the device's auto-provisioned account: set a real password so the
+ * owner can log in from their other devices. Uses UIA with the current
+ * (generated) password as proof of ownership.
+ */
+export async function claimAccount({ baseUrl, userId, accessToken, password, newPassword }) {
+  const url = `${baseUrl}/_matrix/client/v3/account/password`;
+  const auth = (session) => ({
+    type: "m.login.password",
+    identifier: { type: "m.id.user", user: userId },
+    password,
+    ...(session ? { session } : {}),
+  });
+  const body = (session) => JSON.stringify({ new_password: newPassword, auth: auth(session) });
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` };
+
+  let res = await fetch(url, { method: "POST", headers, body: body(null) });
+  let data = await res.json();
+  if (res.status === 401 && data.session) {
+    res = await fetch(url, { method: "POST", headers, body: body(data.session) });
+    data = await res.json();
+  }
+  if (!res.ok) throw new Error(`claim failed: ${JSON.stringify(data)}`);
+  return true;
+}
+
+export async function setDisplayName({ baseUrl, accessToken, userId, displayName }) {
+  const url = `${baseUrl}/_matrix/client/v3/profile/${encodeURIComponent(userId)}/displayname`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ displayname: displayName }),
+  });
+  if (!res.ok) throw new Error(`display name failed: ${await res.text()}`);
+  return true;
+}
+
 export function shareUrl(roomId, baseUrl) {
   const here = `${location.origin}${location.pathname}`;
   return `${here}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}`;
@@ -231,5 +277,11 @@ export function parseShareUrl() {
     host: params.get("host") || "",
     name: params.get("name") || "",
     exp: Number(params.get("exp")) || 0,
+    codeHash: params.get("c") || "",
   };
+}
+
+export async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

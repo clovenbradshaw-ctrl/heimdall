@@ -7,6 +7,7 @@ import {
   shareUrl,
   parseShareUrl,
   deviceKey,
+  sha256Hex,
 } from "./matrix.js";
 import { RtcPeer } from "./rtc.js";
 import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
@@ -19,6 +20,14 @@ const NAME_KEY = "heimdall.name.v1";
 
 const INVITE_TTL = 7 * 24 * 3600 * 1000; // a share link is good for 7 days
 const LEASE_TTL = 12 * 3600 * 1000; // an accepted lease lasts 12h, then must be renewed
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"; // no 0/O/1/I/L
+
+function makeSecretCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  let chars = "";
+  for (const b of bytes) chars += CODE_ALPHABET[b % CODE_ALPHABET.length];
+  return `${chars.slice(0, 4)}-${chars.slice(4)}`;
+}
 
 const FOLD_REPO = "https://github.com/clovenbradshaw-ctrl/the-fold.git";
 const FOLD_WEB = "https://clovenbradshaw-ctrl.github.io/the-fold/";
@@ -36,12 +45,15 @@ const app = {
   displayName: localStorage.getItem(NAME_KEY) || "",
   matrix: null,
   creatorId: null,
+  secret: (() => {
+    const s = loadSession()?.invite;
+    return s?.code && s?.codeHash ? { code: s.code, hash: s.codeHash } : null;
+  })(),
   workers: new Map(), // controller: deviceKey -> worker record
   peers: new Map(), // worker: controller deviceKey -> RtcPeer
   connecting: new Map(), // controller: deviceKey -> timestamp
   engine: null,
   wakeLock: null,
-  note: "",
   leaseUntil: 0,
   leaseExpired: false,
   renewRequested: false,
@@ -91,8 +103,10 @@ async function ensureMatrix() {
     creds = await registerAuto({ baseUrl: app.hs, username: randomUsername(), password });
     saveSession({ creds });
   }
+  const cryptoPrefix = "heimdall::" + creds.userId.replace(/[^a-zA-Z0-9._-]/g, "_");
   const matrix = new MatrixPeer({
     ...creds,
+    cryptoPrefix,
     onSignal,
     onSync: () => {},
     onMembers: () => {
@@ -132,19 +146,26 @@ function onSignal(senderUserId, content) {
 
 /* ------------------------------------------------------------ controller */
 
-function buildInviteUrl() {
+async function buildInviteUrl() {
   const name = app.displayName || app.matrix.userId;
   const exp = Date.now() + INVITE_TTL;
+  if (!app.secret) {
+    const code = makeSecretCode();
+    app.secret = { code, hash: await sha256Hex(code) };
+  }
   app.invite = { name, exp };
-  saveSession({ invite: app.invite });
+  saveSession({ invite: { name, exp, code: app.secret.code, codeHash: app.secret.hash } });
   const base = shareUrl(app.roomId, app.hs);
-  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}`;
+  // Only the hash of the code rides in the link. The code itself is shared
+  // out-of-band, so a stolen link alone can't make a device compute for anyone.
+  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}&c=${app.secret.hash}`;
 }
 
-function refreshShareBox() {
+async function refreshShareBox() {
   if (!shareBoxEl || !app.roomId) return;
-  shareBoxEl.value = buildInviteUrl();
+  shareBoxEl.value = await buildInviteUrl();
   shareBoxEl.disabled = false;
+  if (secretCodeEl && app.secret) secretCodeEl.textContent = app.secret.code;
   inviteExpiryEl.textContent = `link expires ${countdownText(app.invite.exp)} — renew to keep it alive`;
 }
 
@@ -440,12 +461,17 @@ async function acceptDuty() {
     toast(`this invite expired — ask ${share.name || "the host"} for a fresh link`);
     return;
   }
-  const msg = noteEl?.value?.trim() || app.note;
-  if (!msg) {
-    toast("write a message to the host before accepting");
+  if (!share.codeHash) {
+    toast("this link carries no secret — ask the host for a fresh invite with a code");
     return;
   }
-  app.note = msg;
+  const code = (codeEl?.value || "").trim().toUpperCase().replace(/\s+/g, "");
+  const ok = (await sha256Hex(code)) === share.codeHash;
+  if (!ok) {
+    toast("invite code doesn't match — check with the host");
+    codeEl.focus();
+    return;
+  }
   acceptBtnEl.disabled = true;
   acceptBtnEl.textContent = "Joining…";
   try {
@@ -505,7 +531,6 @@ async function announceReady() {
         deviceId: app.matrix.deviceId,
         model: app.modelId,
         name: deviceName(),
-        note: app.note,
         leaseUntil: app.leaseUntil,
       },
       3,
@@ -530,7 +555,6 @@ function ensureWorkerPeer(remoteDevice) {
         model: app.modelId,
         name: deviceName(),
         ua: navigator.userAgent,
-        note: app.note,
         leaseUntil: app.leaseUntil,
       });
     },
@@ -641,8 +665,8 @@ async function keepAwake() {
 
 /* ------------------------------------------------------------------- view */
 
-let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
-let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, noteEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
+let shareBoxEl, inviteExpiryEl, secretCodeEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
+let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, codeEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
 function header() {
   return el("header", { class: "site" }, [
@@ -706,10 +730,16 @@ function controllerView() {
 
   shareBoxEl = el("input", { readonly: true, value: "", placeholder: "share link appears here" });
   inviteExpiryEl = el("div", { class: "muted small" });
+  secretCodeEl = el("span", { class: "kbd" });
   const shareRow = el("div", { class: "linkbox" }, [
     shareBoxEl,
     copyBtn("copy", () => shareBoxEl.value),
     el("button", { class: "ghost small", text: "renew link", onclick: refreshShareBox }),
+  ]);
+  const codeRow = el("div", { class: "row" }, [
+    el("span", { class: "muted small", text: "invite code (tell them this separately, never in the link):" }),
+    secretCodeEl,
+    copyBtn("copy", () => app.secret?.code || ""),
   ]);
 
   const createBtn = el("button", {
@@ -752,11 +782,12 @@ function controllerView() {
     header(),
     el("div", { class: "card" }, [
       el("h2", { text: "Fleet" }),
-      el("p", { class: "muted", text: "The link names you, carries an expiry, and makes the worker show its own IP before accepting. The room is only a directory — prompts and answers travel device-to-device over WebRTC, never through the room. Everyone who borrows must first give." }),
+      el("p", { class: "muted", text: "The link names you, carries an expiry, and a secret code the worker must enter to accept. The room is only a directory — prompts and answers travel device-to-device over WebRTC, never through the room. Everyone who borrows must first give." }),
       el("label", { text: "your name" }),
       nameEl,
       el("div", { class: "row", style: "" }, [createBtn, freshBtn]),
       shareRow,
+      codeRow,
       inviteExpiryEl,
     ]),
     fleetCardEl,
@@ -780,9 +811,7 @@ function renderFleet() {
     const h = rec.hello;
     const color = rec.status === "ready" ? "ok" : rec.status === "expired" ? "err" : rec.status === "lost" ? "err" : "warn";
     const name = h?.name || rec.device.userId;
-    const meta = h
-      ? `${h.model || ""}${h.note ? ` · said “${h.note.slice(0, 48)}${h.note.length > 48 ? "…" : ""}”` : ""}`
-      : `linking…`;
+    const meta = h ? `${h.model || ""}` : `linking…`;
     const l = ledgerOf(key);
     const credit = l.give || l.borrow
       ? ` · gave ${l.give} took ${l.borrow}`
@@ -841,7 +870,14 @@ function workerView() {
     localStorage.setItem(MODEL_KEY, app.modelId);
   });
 
-  noteEl = el("textarea", { placeholder: `write a message to ${who} — why you’re lending compute…` });
+  codeEl = el("input", {
+    placeholder: "ABCD-EFGH",
+    autocapitalize: "characters",
+    autocomplete: "off",
+    oninput: (e) => {
+      e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 9);
+    },
+  });
 
   const acceptCard = el("div", { class: "card" });
   acceptBtnEl = el("button", { class: "primary big", text: "Accept compute duties", onclick: acceptDuty });
@@ -852,6 +888,12 @@ function workerView() {
   const expLine = el("div", {
     class: "muted small",
     text: share.exp ? `this invite ${countdownText(share.exp)}` : "no expiry set on this link — treat it with care",
+  });
+  const codeLine = el("div", {
+    class: "alert " + (share.codeHash ? "warn" : "err"),
+    text: share.codeHash
+      ? "The link only proves who asked — the host gives you the invite code separately. A stolen link alone can't make your device compute for anyone."
+      : "This link carries no secret code — do not accept it. Ask the host for a fresh invite.",
   });
 
   acceptCard.append(
@@ -866,8 +908,9 @@ function workerView() {
       el("span", { class: "badge", text: deviceName() }),
     ]),
     el("div", { style: "height:10px" }),
-    el("label", { text: "message to the host (required)" }),
-    noteEl,
+    codeLine,
+    el("label", { text: "invite code (required)" }),
+    codeEl,
     el("div", { style: "height:10px" }),
     acceptBtnEl,
     expLine,

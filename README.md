@@ -23,8 +23,8 @@ central server.
 1. Open the deployed site. Enter the name you want workers to see, click **Create fleet room**.
 2. Copy the share link — it names you (your Matrix id + display name), carries an expiry, and sends it to anyone.
 3. They open it and see **who is asking**, their own **public IP**, and the invite's remaining time.
-4. They write you a message, press **Accept compute duties**, pick a model size.
-5. Back on your screen they appear under **Workers**, with the message they wrote and a countdown on their lease.
+4. You tell them the invite code out-of-band; they enter it, press **Accept compute duties**, pick a model size.
+5. Back on your screen they appear under **Workers**, with a countdown on their lease.
 
 Every device that presses accept auto-creates a throwaway Matrix account on
 hyphae.social (a single `m.login.dummy` registration step — no email, no
@@ -41,9 +41,18 @@ The handshake is consent-first, and everything is time-bound:
   the worker sees a hard warning.
 - **Their own exposure.** Before accepting, the worker is shown its own public
   IP and told that the host will see that IP and the device type once connected.
-- **A message back.** Accepting requires writing a message to the host. It
-  travels with the handshake over WebRTC, device-to-device — never stored in
-  the room.
+- **A secret code.** Every invite has a one-time secret code. The link carries
+  only the code's SHA-256 hash; the host shares the code itself out-of-band.
+  Accepting requires entering the code, so a stolen link alone cannot make a
+  device compute for anyone — the worker verifies the code locally and never
+  transmits it.
+- **Accounts.** Each device auto-creates its own account on hyphae.social, and
+  a device that's already signed in reuses its own session. Crypto state is
+  stored per account in IndexedDB (scoped via `cryptoDatabasePrefix`), so
+  switching accounts — or another Matrix app on the same origin — never
+  triggers the shared-store mismatch error. The account can be **claimed** with
+  a real password and reused to log in from other devices, and is what the fold
+  will accept.
 - **Leases.** An invite expires after **7 days** (host renews it with one
   click). An accepted lease runs **12 hours**; when it lapses the worker stops
   answering and the host is prompted to nudge them. Renewal is a fresh accept,
