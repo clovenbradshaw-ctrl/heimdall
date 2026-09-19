@@ -11,6 +11,8 @@ import {
 } from "./matrix.js";
 import { RtcPeer } from "./rtc.js";
 import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
+import { pickGiver as routePickGiver, observe as routeObserve, markSent as routeMarkSent, isRoomMouth, mergeInflight, mergeMeanMs, electLeader, SIBLING_TTL_MS } from "./route.js";
+import { amAlly, servesOf, pruneControllers, pickForwarder, makeFwdJob, validFwdJob, controllerKey, CONTROLLER_TTL_MS, FWD_TTL } from "./swarm.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
 import {
   generateDeviceKeyPair,
@@ -62,8 +64,16 @@ const app = {
   timers: [],
   pendingVerify: null,
   ledger: new Map(), // deviceKey -> { give, borrow }
-  relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec }
-  giverIdx: 0,
+  relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec, t0, model }
+  route: { inflight: {}, meanMs: {}, idx: 0 }, // bifrost evidence: measured wait per giver
+  siblings: new Map(), // same-account heimdall deviceKey -> { at, deviceId, inflight, meanMs }
+  controllers: new Map(), // every announced heimdall deviceKey -> { at, deviceId, userId, serves, sameAccount }
+  coordPeers: new Map(), // sibling deviceKey -> { peer, device, status }
+  fwdRelay: new Map(), // fwdId -> origin- or servant-side forward state
+  seenFwd: [], // fwdIds already served here — replays refused
+  fwdIdx: 0, // rotation counter for forward targeting
+  presenceTick: 0, // reconcile counter — hello broadcast every 3rd tick
+  giverIdx: 0, // legacy counter, kept for broadcast rotation symmetry
   lendDevice: false,
   hubEngine: null,
   credit: { give: 0, borrow: 0, credit: 0 },
@@ -131,9 +141,56 @@ async function tryLogin({ baseUrl, username, password }) {
 /* ------------------------------------------------------------- signaling */
 
 async function onSignal(senderUserId, content) {
+  // Sibling heimdall load snapshots (same account, another surface). Only
+  // the account's own devices are trusted for steering — a worker or a
+  // stranger's controller could otherwise inflate load and steer the fleet.
+  // Cross-account coordination rides on worker-reported queueDepth instead,
+  // which the worker itself authenticates over its own link.
+  if (content.type === "coord" && mode === "controller") {
+    if (!app.matrix || senderUserId !== app.matrix.userId) return;
+    if (!content.deviceId || content.deviceId === app.matrix.deviceId) return;
+    app.siblings.set(deviceKey({ userId: senderUserId, deviceId: content.deviceId }), {
+      at: content.at || Date.now(),
+      deviceId: content.deviceId,
+      inflight: content.inflight || {},
+      meanMs: content.meanMs || {},
+    });
+    renderFleet();
+    return;
+  }
+  // Another heimdall announcing itself (any account) or heartbeating.
+  // Recorded for the organism view and forward targeting. Load snapshots
+  // that STEER routing are still same-account only (see "coord" above) —
+  // a stranger's serves list only ever attracts a forward it must then
+  // actually serve, and every forward carries its own timeout.
+  if ((content.type === "hello-controller" || content.type === "coord-heartbeat") && mode === "controller") {
+    if (!app.matrix || !content.deviceId) return;
+    if (String(content.deviceId) === String(app.matrix.deviceId) && senderUserId === app.matrix.userId) return;
+    app.controllers.set(deviceKey({ userId: senderUserId, deviceId: content.deviceId }), {
+      at: content.at || Date.now(),
+      deviceId: content.deviceId,
+      userId: senderUserId,
+      serves: Array.isArray(content.serves) ? content.serves.filter((m) => typeof m === "string") : [],
+      sameAccount: senderUserId === app.matrix.userId,
+    });
+    renderFleet();
+    return;
+  }
   if (content.type === "signal") {
     const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
     if (mode === "controller") {
+      // A sibling heimdall's WebRTC signal rides the same to-device type:
+      // coord peers first (the organism's nerves), workers after.
+      const coord = app.coordPeers.get(key);
+      if (coord?.peer) {
+        coord.peer.handleSignal(content.label, content.data).catch(() => {});
+        return;
+      }
+      if (app.controllers.has(key)) {
+        ensureCoordLink({ userId: senderUserId, deviceId: content.deviceId }, true)
+          .then((peer) => peer.handleSignal(content.label, content.data).catch(() => {}));
+        return;
+      }
       const rec = app.workers.get(key);
       if (rec?.peer) rec.peer.handleSignal(content.label, content.data).catch(() => {});
     } else {
@@ -275,18 +332,101 @@ async function lendMyDevice() {
 
 async function reconcile() {
   if (!app.matrix || !app.roomId) return;
-  const members = app.matrix.roomMembers();
-  for (const userId of members) {
-    const devs = await app.matrix.devicesOf(userId, { retry: 0 });
-    for (const device of devs) {
-      const key = deviceKey(device);
-      if (app.workers.has(key)) continue;
-      const last = app.connecting.get(key) || 0;
-      if (Date.now() - last < 30000) continue;
-      app.connecting.set(key, Date.now());
-      ensureWorkerLink(key, device);
+  // Ally mode: this room belongs to another account, so its workers will
+  // never answer our offers (they serve their creator's devices only).
+  // Don't storm them — contribute the lent device, accept forwards.
+  const ally = amAlly({ creatorId: app.matrix.roomCreator(), userId: app.matrix.userId });
+  app.ally = ally;
+  if (!ally) {
+    const members = app.matrix.roomMembers();
+    for (const userId of members) {
+      const devs = await app.matrix.devicesOf(userId, { retry: 0 });
+      for (const device of devs) {
+        const key = deviceKey(device);
+        if (app.workers.has(key)) continue;
+        const last = app.connecting.get(key) || 0;
+        if (Date.now() - last < 30000) continue;
+        app.connecting.set(key, Date.now());
+        ensureWorkerLink(key, device);
+      }
     }
   }
+  presenceHeartbeat();
+}
+
+/** The organism's pulse. Every tick: prune the quiet, share load snapshots
+ *  with same-account siblings (trusted steering), heartbeat serves to every
+ *  announced controller, and every 3rd tick broadcast hello-controller to
+ *  the whole room so allied accounts can find us. All best-effort, one
+ *  attempt — the next 15s tick sends it again. */
+async function siblingHeartbeat() {
+  return presenceHeartbeat();
+}
+
+async function presenceHeartbeat() {
+  if (mode !== "controller" || !app.matrix) return;
+  const now = Date.now();
+  for (const [key, snap] of app.siblings) {
+    if (now - snap.at > SIBLING_TTL_MS) app.siblings.delete(key);
+  }
+  app.controllers = pruneControllers(app.controllers, now);
+  const serves = servesOf(app.workers, selfGiver());
+  // Same-account siblings: full load snapshots (shared steering).
+  try {
+    const own = await app.matrix.devicesOf(app.matrix.userId, { retry: 0 });
+    const snap = {
+      type: "coord",
+      deviceId: app.matrix.deviceId,
+      at: now,
+      inflight: app.route.inflight,
+      meanMs: app.route.meanMs,
+      serves,
+    };
+    for (const d of own) {
+      if (String(d.deviceId) === String(app.matrix.deviceId)) continue;
+      app.matrix.sendSignalRetry(d, snap, 1).then(() => {});
+    }
+  } catch { /* presence is best-effort */ }
+  // Announced controllers (any account): serves heartbeat.
+  const beat = { type: "coord-heartbeat", deviceId: app.matrix.deviceId, at: now, serves };
+  for (const [, c] of app.controllers) {
+    app.matrix.sendSignalRetry({ userId: c.userId, deviceId: c.deviceId }, beat, 1).then(() => {});
+  }
+  // Whole room, every 3rd tick: hello so unknown allies can find us.
+  // Workers ignore unknown to-device types, so this noise costs them nothing.
+  app.presenceTick++;
+  if (app.presenceTick % 3 === 0) {
+    const hello = { type: "hello-controller", deviceId: app.matrix.deviceId, at: now, serves };
+    try {
+      for (const userId of app.matrix.roomMembers()) {
+        const devs = await app.matrix.devicesOf(userId, { retry: 0 });
+        for (const d of devs) app.matrix.sendSignalRetry(d, hello, 1).then(() => {});
+      }
+    } catch { /* presence is best-effort */ }
+  }
+  renderFleet();
+}
+
+/** What the router sees: own measurements plus live sibling snapshots, and
+ *  worker-reported queue depth (jobs other heimdalls — any account — sent
+ *  that no local map can see). */
+function effectiveLoad() {
+  const snaps = [...app.siblings.values()];
+  return {
+    inflight: mergeInflight(app.route.inflight, snaps),
+    meanMs: mergeMeanMs(app.route.meanMs, snaps),
+  };
+}
+
+/** Worker-reported queue depth per giver key, plus the host's own engine. */
+function queuedLoad() {
+  const out = {};
+  for (const [key, rec] of app.workers) {
+    if (Number.isFinite(rec.queueDepth) && rec.queueDepth > 0) out[key] = rec.queueDepth;
+  }
+  const selfPending = app.hubEngine?.pending ?? 0;
+  if (selfPending > 0) out.self = selfPending;
+  return out;
 }
 
 function ensureWorkerLink(key, device) {
@@ -330,6 +470,19 @@ function ensureWorkerLink(key, device) {
   });
 }
 
+function selfGiver() {
+  if (app.lendDevice && app.hubEngine?.loaded) {
+    return { key: "self", model: app.hubEngine.modelId || app.modelId, loaded: true };
+  }
+  return null;
+}
+
+function noteObserved(giverKey, ms, ok) {
+  const next = routeObserve(app.route, giverKey, { ms, ok });
+  app.route.inflight = next.inflight;
+  app.route.meanMs = next.meanMs;
+}
+
 function onWorkerMessage(key, rec, msg) {
   // A relayed job: worker borrowed from the fleet, tokens come back via the hub.
   if (msg.type === "token" && app.relay.has(msg.id)) {
@@ -340,6 +493,10 @@ function onWorkerMessage(key, rec, msg) {
   if ((msg.type === "result" || msg.type === "error") && app.relay.has(msg.id)) {
     const r = app.relay.get(msg.id);
     app.relay.delete(msg.id);
+    clearTimeout(r.timer);
+    noteObserved(r.giverKey, Date.now() - r.t0, msg.type === "result");
+    // A model-mismatch error is the router's own failure to avoid — never
+    // settle credit on it, so a misrouted job doesn't mint borrow debt.
     if (msg.type === "result") settle(r.giverKey, r.borrowerKey);
     if (r.borrowerRec?.peer?.opened) {
       r.borrowerRec.peer.send({ type: msg.type, id: msg.id, text: msg.text, duration_ms: msg.duration_ms, message: msg.message });
@@ -356,20 +513,29 @@ function onWorkerMessage(key, rec, msg) {
     rec.hello = msg;
     rec.status = "ready";
     rec.lastSeen = Date.now();
+    rec.queueDepth = Number.isFinite(msg.queueDepth) && msg.queueDepth > 0 ? msg.queueDepth : 0;
     renderFleet();
   } else if (msg.type === "lease") {
     rec.hello = { ...(rec.hello || {}), leaseUntil: msg.until };
     rec.renewed = true;
     rec.status = "ready";
     rec.lastSeen = Date.now();
+    if (Number.isFinite(msg.queueDepth)) rec.queueDepth = Math.max(0, msg.queueDepth);
     renderFleet();
   } else if (msg.type === "ping") {
     rec.lastSeen = Date.now();
+    // Backpressure + model freshness from the worker itself: what the
+    // worker reports queued covers jobs sibling heimdalls sent that no
+    // local inflight map can see. A cross-account heimdall coordinates
+    // through exactly this number.
+    if (Number.isFinite(msg.queueDepth)) rec.queueDepth = Math.max(0, msg.queueDepth);
+    if (msg.model && rec.hello) rec.hello.model = msg.model;
   } else if (msg.type === "token") {
     consolePush(msg.id, msg.text);
   } else if (msg.type === "result") {
     consolePush(msg.id, `\n[done ${msg.duration_ms}ms]\n`);
     rec.lastSeen = Date.now();
+    noteObserved(key, msg.duration_ms ?? null, true);
     // The hub borrowed from this worker — it gave compute. Credit it.
     const l = app.ledger.get(key) || { give: 0, borrow: 0 };
     l.give++;
@@ -378,6 +544,9 @@ function onWorkerMessage(key, rec, msg) {
     renderFleet();
   } else if (msg.type === "error") {
     consolePush(msg.id, `\n[error] ${msg.message}\n`);
+    // A model_mismatch here means the broadcast label drifted or the
+    // worker swapped models mid-lease — free the slot, keep the mean.
+    noteObserved(key, null, false);
     rec.status = "ready";
     renderFleet();
   }
@@ -409,26 +578,67 @@ function settle(giverKey, borrowerKey) {
   pushCredit(borrowerKey, b);
 }
 
+const JOB_TIMEOUT_MS = 120_000;
+
 function onBorrowJob(borrowerKey, rec, msg) {
   const l = ledgerOf(borrowerKey);
   if (l.borrow >= l.give) {
     rec.peer.send({ type: "error", id: msg.id, message: "no credit — you have to give compute before you can borrow. Serve a job first." });
     return;
   }
-  const giver = pickGiver(borrowerKey);
-  if (!giver) {
-    rec.peer.send({ type: "error", id: msg.id, message: "no giver available right now" });
+  const wantModel = msg.model ?? null;
+  // A remote Matrix mouth is never served by a local WebLLM giver. Route
+  // it down the Matrix path instead of quietly answering with the wrong
+  // model — the-fold's pinned-model rule, one level down.
+  if (wantModel && isRoomMouth(wantModel)) {
+    rec.peer.send({ type: "error", id: msg.id, message: "remote Matrix mouth — not routable to local workers" });
     return;
   }
+  const eff = effectiveLoad();
+  const picked = routePickGiver(app.workers, {
+    borrowerKey,
+    model: wantModel,
+    self: selfGiver(),
+    inflight: eff.inflight,
+    meanMs: eff.meanMs,
+    queued: queuedLoad(),
+    idx: app.route.idx++,
+  });
+  if (!picked.giver) {
+    // No local giver — the organism migrates the work, not the refusal.
+    // Offer it to a sibling that advertises the model; only when nobody
+    // can serve does the borrower hear "no".
+    forwardJobToSibling(borrowerKey, rec, msg, wantModel, picked.reason).catch(() => {
+      rec.peer?.send?.({
+        type: "error",
+        id: msg.id,
+        message: picked.reason === "no_giver_for_model"
+          ? `no giver loaded with ${wantModel} right now`
+          : "no giver available right now",
+      });
+    });
+    return;
+  }
+  const giver = picked.giver;
   const req = {
     type: "infer",
     id: msg.id,
+    model: wantModel,
     messages: msg.messages || [{ role: "user", content: msg.prompt }],
     stream: true,
     temperature: msg.temperature ?? 0.7,
     max_tokens: msg.max_tokens ?? 1024,
   };
-  app.relay.set(msg.id, { giverKey: giver.key, borrowerKey, borrowerRec: rec });
+  app.route.inflight = routeMarkSent(app.route.inflight, giver.key);
+  const t0 = Date.now();
+  const timer = setTimeout(() => {
+    if (!app.relay.has(msg.id)) return;
+    app.relay.delete(msg.id);
+    noteObserved(giver.key, null, false);
+    rec.peer?.send?.({ type: "error", id: msg.id, message: "giver timed out — try again" });
+    renderFleet();
+  }, JOB_TIMEOUT_MS);
+  app.relay.set(msg.id, { giverKey: giver.key, borrowerKey, borrowerRec: rec, t0, model: wantModel, timer });
   if (giver.key === "self") {
     serveSelf(req, rec);
   } else {
@@ -436,35 +646,283 @@ function onBorrowJob(borrowerKey, rec, msg) {
   }
 }
 
-function pickGiver(borrowerKey) {
-  const ready = [...app.workers.values()].filter((w) => {
-    const key = deviceKey(w.device);
-    const leaseDead = w.hello?.leaseUntil && Date.now() > w.hello.leaseUntil;
-    return key !== borrowerKey && w.status === "ready" && w.peer?.opened && !leaseDead;
+function pickGiver(borrowerKey, model = null) {
+  const eff = effectiveLoad();
+  const picked = routePickGiver(app.workers, {
+    borrowerKey,
+    model,
+    self: selfGiver(),
+    inflight: eff.inflight,
+    meanMs: eff.meanMs,
+    queued: queuedLoad(),
+    idx: app.route.idx++,
   });
-  if (ready.length === 0) {
-    return app.lendDevice && app.hubEngine?.loaded ? { key: "self" } : null;
-  }
-  const pick = ready[app.giverIdx % ready.length];
-  app.giverIdx++;
-  return { key: deviceKey(pick.device), rec: pick };
+  return picked.giver;
 }
 
 async function serveSelf(req, borrowerRec) {
   const t0 = Date.now();
   try {
+    // The host's own device is a giver under the same pin: a job naming a
+    // model it isn't loaded with is refused, never silently answered.
+    const loaded = app.hubEngine?.modelId || app.modelId;
+    if (req.model && req.model !== loaded) {
+      throw new Error(`model_mismatch: host loaded with ${loaded}, job asked for ${req.model}`);
+    }
     const { text } = await app.hubEngine.infer(
       req.messages,
       { stream: true, temperature: req.temperature, max_tokens: req.max_tokens },
       (delta) => borrowerRec.peer?.send({ type: "token", id: req.id, text: delta }),
     );
-    settle("self", app.relay.get(req.id)?.borrowerKey || "");
+    const r = app.relay.get(req.id);
+    if (r) clearTimeout(r.timer);
+    app.relay.delete(req.id);
+    noteObserved("self", Date.now() - t0, true);
+    settle("self", r?.borrowerKey || "");
     borrowerRec.peer?.send({ type: "result", id: req.id, text, duration_ms: Date.now() - t0 });
   } catch (e) {
-    borrowerRec.peer?.send({ type: "error", id: req.id, message: String(e?.message || e) });
-  } finally {
+    const r = app.relay.get(req.id);
+    if (r) clearTimeout(r.timer);
     app.relay.delete(req.id);
+    noteObserved("self", Date.now() - t0, false);
+    borrowerRec.peer?.send({ type: "error", id: req.id, message: String(e?.message || e) });
   }
+}
+
+/* ------------------------------------------- the organism's nerves ----
+   Controller-to-controller DataChannels: work migrates over these when one
+   heimdall has no local giver. RtcPeer is reused whole — a coord peer is a
+   worker peer pointed at a sibling, speaking fwd-* envelopes instead of
+   infer. Timeouts keep every migration loud: a link that won't open in
+   15s, a job unanswered in 120s, both fail the borrower with words. */
+
+const COORD_OPEN_MS = 15_000;
+
+function coordSend(siblingKey, msg) {
+  const c = app.coordPeers.get(siblingKey);
+  if (c?.peer?.opened) {
+    c.peer.send(msg);
+    return true;
+  }
+  return false;
+}
+
+/** Open (or reuse) the coord link to a sibling controller. Inbound offers
+ *  (inbound=true, from onSignal) only bind the peer — the offer itself is
+ *  handled by the caller right after. */
+function ensureCoordLink(device, inbound = false) {
+  const key = controllerKey(device);
+  const existing = app.coordPeers.get(key);
+  // One link per sibling: concurrent forwards share the pending open
+  // instead of orphaning duplicate peers.
+  if (existing?.peer) {
+    if (existing.peer.opened) return Promise.resolve(existing.peer);
+    if (existing.opening) return existing.opening;
+  }
+  const entry = { device, peer: null, status: "linking", opening: null };
+  const opening = new Promise((resolve, reject) => {
+    const peer = new RtcPeer({
+      signal: (label, data) =>
+        app.matrix
+          .sendSignalRetry(device, { type: "signal", deviceId: app.matrix.deviceId, label, data })
+          .then(() => {}),
+      onOpen: () => {
+        entry.status = "open";
+        renderFleet();
+        resolve(peer);
+      },
+      onClose: () => {
+        entry.status = "lost";
+        renderFleet();
+        setTimeout(() => {
+          if (app.coordPeers.get(key) === entry) app.coordPeers.delete(key);
+        }, 5000);
+      },
+      onMessage: (cmsg) => onCoordMessage(key, device, cmsg),
+    });
+    entry.peer = peer;
+    app.coordPeers.set(key, entry);
+    renderFleet();
+    if (!inbound) {
+      peer.offer().catch((e) => {
+        app.coordPeers.delete(key);
+        reject(e);
+      });
+      setTimeout(() => {
+        if (!peer.opened) {
+          app.coordPeers.delete(key);
+          reject(new Error("coord link timed out"));
+        }
+      }, COORD_OPEN_MS);
+    } else {
+      // Inbound: the offer arrives via onSignal right after — resolve now
+      // so the caller can handle it; if nothing ever comes, reap the husk.
+      resolve(peer);
+      setTimeout(() => {
+        if (!peer.opened && app.coordPeers.get(key) === entry) app.coordPeers.delete(key);
+      }, COORD_OPEN_MS);
+    }
+  });
+  entry.opening = opening;
+  opening.then(
+    () => { entry.opening = null; },
+    () => { if (app.coordPeers.get(key)?.opening === opening) app.coordPeers.delete(key); },
+  );
+  return opening;
+}
+
+/** Migrate a borrow no local giver could serve. Tries each able sibling
+ *  once (tried-list, huginn's discipline); the first open link that takes
+ *  the job wins. Rejects when nobody can — the caller then fails loudly. */
+async function forwardJobToSibling(borrowerKey, borrowerRec, msg, wantModel) {
+  const tried = [];
+  for (;;) {
+    const { forwarder } = pickForwarder(app.controllers, {
+      wantModel,
+      tried,
+      idx: app.fwdIdx++,
+    });
+    if (!forwarder) throw new Error("no sibling can serve");
+    tried.push(forwarder.key);
+    const device = { userId: forwarder.rec.userId, deviceId: forwarder.rec.deviceId };
+    let peer;
+    try {
+      peer = await ensureCoordLink(device);
+      if (!peer.opened) throw new Error("coord link not open");
+    } catch {
+      continue; // this sibling unreachable — try the next, never stall
+    }
+    const fwdId = crypto.randomUUID();
+    const env = makeFwdJob({
+      fwdId,
+      from: controllerKey({ userId: app.matrix.userId, deviceId: app.matrix.deviceId }),
+      job: {
+        id: msg.id,
+        model: wantModel,
+        messages: msg.messages || [{ role: "user", content: msg.prompt }],
+        temperature: msg.temperature ?? 0.7,
+        max_tokens: msg.max_tokens ?? 1024,
+      },
+    });
+    const t0 = Date.now();
+    const timer = setTimeout(() => {
+      if (!app.fwdRelay.has(fwdId)) return;
+      app.fwdRelay.delete(fwdId);
+      noteObserved(forwarder.key, null, false);
+      borrowerRec.peer?.send?.({ type: "error", id: msg.id, message: "sibling heimdall timed out — try again" });
+      renderFleet();
+    }, JOB_TIMEOUT_MS);
+    app.fwdRelay.set(fwdId, { borrowerKey, borrowerRec, siblingKey: forwarder.key, t0, timer, jobId: msg.id });
+    app.route.inflight = routeMarkSent(app.route.inflight, forwarder.key);
+    peer.send(env);
+    return; // handed off — tokens/results land in onCoordMessage
+  }
+}
+
+/** One hop's far end. fwd-job is SERVED here (never re-forwarded — ttl 1),
+ *  fwd-token/result/error continue a job we originated. */
+function onCoordMessage(siblingKey, siblingDevice, cmsg) {
+  if (!cmsg || typeof cmsg !== "object") return;
+  if (cmsg.kind === "fwd-job") {
+    serveForwarded(siblingKey, cmsg);
+    return;
+  }
+  const st = app.fwdRelay.get(cmsg.fwdId);
+  if (!st) return;
+  if (cmsg.kind === "fwd-token") {
+    if (st.borrowerRec?.peer?.opened) st.borrowerRec.peer.send({ type: "token", id: st.jobId, text: cmsg.text });
+  } else if (cmsg.kind === "fwd-result" || cmsg.kind === "fwd-error") {
+    app.fwdRelay.delete(cmsg.fwdId);
+    clearTimeout(st.timer);
+    // Per-hop settlement: the sibling earned with us, the borrower owes us.
+    // Symmetric with every direct route — the organism keeps no central
+    // wallet, each link settles its own.
+    noteObserved(st.siblingKey, Date.now() - st.t0, cmsg.kind === "fwd-result");
+    if (cmsg.kind === "fwd-result") settle(st.siblingKey, st.borrowerKey);
+    if (st.borrowerRec?.peer?.opened) {
+      st.borrowerRec.peer.send(
+        cmsg.kind === "fwd-result"
+          ? { type: "result", id: st.jobId, text: cmsg.text, duration_ms: cmsg.duration_ms }
+          : { type: "error", id: st.jobId, message: cmsg.message },
+      );
+    }
+    renderFleet();
+  }
+}
+
+/** Serve a sibling's forwarded job from LOCAL givers only. The sibling is
+ *  the borrower of record: settlement and credit flow through the existing
+ *  relay path unchanged, via a virtual borrowerRec that speaks fwd-*
+ *  back over the coord link. */
+function serveForwarded(siblingKey, env) {
+  const fail = (message) => coordSend(siblingKey, { kind: "fwd-error", fwdId: env.fwdId, id: env.job?.id, message });
+  const v = validFwdJob(env, app.seenFwd);
+  if (!v.ok) {
+    if (v.reason !== "forward_replay") fail(`refused forward: ${v.reason}`);
+    return;
+  }
+  app.seenFwd.push(env.fwdId);
+  if (app.seenFwd.length > 500) app.seenFwd.splice(0, app.seenFwd.length - 500);
+  // Same job.id twice (an origin retry after its own timeout, while we still
+  // serve the first): refuse rather than overwrite the live relay entry,
+  // which would let the first timer kill the second job.
+  if (app.relay.has(env.job.id)) {
+    fail("already serving that job here — dedupe by job id");
+    return;
+  }
+  const wantModel = env.job.model ?? null;
+  if (wantModel && isRoomMouth(wantModel)) {
+    fail("remote Matrix mouth — not routable to local workers");
+    return;
+  }
+  const eff = effectiveLoad();
+  const picked = routePickGiver(app.workers, {
+    borrowerKey: siblingKey, // a sibling is never its own giver
+    model: wantModel,
+    self: selfGiver(),
+    inflight: eff.inflight,
+    meanMs: eff.meanMs,
+    queued: queuedLoad(),
+    idx: app.route.idx++,
+  });
+  if (!picked.giver) {
+    fail(picked.reason === "no_giver_for_model" ? `no giver loaded with ${wantModel} here` : "no giver available here");
+    return;
+  }
+  const giver = picked.giver;
+  // Virtual borrower: the relay path settles (giver ↔ sibling) and pushes
+  // credit exactly as for a direct borrow; only the last mile differs.
+  const virtualRec = {
+    peer: {
+      opened: true,
+      send: (m) => {
+        if (m.type === "token") coordSend(siblingKey, { kind: "fwd-token", fwdId: env.fwdId, id: env.job.id, text: m.text });
+        else if (m.type === "result") coordSend(siblingKey, { kind: "fwd-result", fwdId: env.fwdId, id: env.job.id, text: m.text, duration_ms: m.duration_ms });
+        else if (m.type === "error") coordSend(siblingKey, { kind: "fwd-error", fwdId: env.fwdId, id: env.job.id, message: m.message });
+      },
+    },
+  };
+  const req = {
+    type: "infer",
+    id: env.job.id,
+    model: wantModel,
+    messages: env.job.messages,
+    stream: true,
+    temperature: env.job.temperature ?? 0.7,
+    max_tokens: env.job.max_tokens ?? 1024,
+  };
+  app.route.inflight = routeMarkSent(app.route.inflight, giver.key);
+  const t0 = Date.now();
+  const timer = setTimeout(() => {
+    if (!app.relay.has(req.id)) return;
+    app.relay.delete(req.id);
+    noteObserved(giver.key, null, false);
+    fail("giver timed out — try again");
+    renderFleet();
+  }, JOB_TIMEOUT_MS);
+  app.relay.set(req.id, { giverKey: giver.key, borrowerKey: siblingKey, borrowerRec: virtualRec, t0, model: wantModel, timer });
+  if (giver.key === "self") serveSelf(req, virtualRec);
+  else giver.rec.peer.send(req);
 }
 
 function nudgeRenew(key) {
@@ -477,19 +935,48 @@ function sendInferAll() {
   if (!prompt) return;
   const id = crypto.randomUUID();
   consolePush(id, `▶ ${prompt}\n`);
+  // A broadcast fans out to every eligible giver (each model answers in
+  // its own voice — that IS the experiment). Per-target inflight is
+  // tracked so the next borrowed job sees the real load.
   let sent = 0;
-  for (const rec of app.workers.values()) {
-    if (rec.peer?.opened && rec.status !== "expired") {
+  for (const [wkey, rec] of app.workers) {
+    if (rec.peer?.opened && rec.status !== "expired" && !(rec.hello?.leaseUntil && Date.now() > rec.hello.leaseUntil)) {
       rec.peer.send({
         type: "infer",
         id,
+        model: rec.hello?.model ?? null, // labelled, so a mismatch is visible, never silent
         messages: [{ role: "user", content: prompt }],
         stream: true,
         temperature: 0.7,
         max_tokens: 1024,
       });
+      app.route.inflight = routeMarkSent(app.route.inflight, wkey);
       sent++;
     }
+  }
+  const self = selfGiver();
+  if (self) {
+    const req = {
+      type: "infer",
+      id: `self:${id}`,
+      model: self.model,
+      messages: [{ role: "user", content: prompt }],
+      stream: true,
+      temperature: 0.7,
+      max_tokens: 1024,
+    };
+    app.route.inflight = routeMarkSent(app.route.inflight, "self");
+    const t0 = Date.now();
+    app.hubEngine.infer(req.messages, { stream: true, temperature: 0.7, max_tokens: 1024 }, (d) => consolePush(id, d))
+      .then(({ text }) => {
+        noteObserved("self", Date.now() - t0, true);
+        consolePush(id, `\n[self done ${Date.now() - t0}ms]\n`);
+      })
+      .catch((e) => {
+        noteObserved("self", Date.now() - t0, false);
+        consolePush(id, `\n[self error] ${e?.message || e}\n`);
+      });
+    sent++;
   }
   if (!sent) toast("no live workers connected");
 }
@@ -574,7 +1061,7 @@ async function acceptDuty() {
     app.renewRequested = false;
     localStorage.setItem(`heimdall.lease.${app.roomId}`, String(app.leaseUntil));
     for (const peer of app.peers.values()) {
-      if (peer.opened) peer.send({ type: "lease", until: app.leaseUntil });
+      if (peer.opened) peer.send({ type: "lease", until: app.leaseUntil, queueDepth: app.engine?.pending ?? 0 });
     }
     statusEl.textContent = `Standing by until ${countdownText(app.leaseUntil)}`;
     acceptBtnEl.textContent = "Renew compute duties";
@@ -583,7 +1070,14 @@ async function acceptDuty() {
     setInterval(() => announceReady(), 20000);
     setInterval(() => {
       for (const peer of app.peers.values()) {
-        if (peer.opened) peer.send({ type: "ping", t: Date.now() });
+        if (peer.opened) {
+          peer.send({
+            type: "ping",
+            t: Date.now(),
+            queueDepth: app.engine?.pending ?? 0,
+            model: app.engine?.modelId || app.modelId,
+          });
+        }
       }
     }, 15000);
     await keepAwake();
@@ -665,7 +1159,8 @@ async function announceReady() {
       {
         type: "ready",
         deviceId: app.matrix.deviceId,
-        model: app.modelId,
+        model: app.engine?.modelId || app.modelId, // the weights actually loaded, never the picker alone
+        queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
         leaseUntil: app.leaseUntil,
       },
@@ -688,7 +1183,8 @@ function ensureWorkerPeer(remoteDevice) {
         type: "hello",
         role: "worker",
         deviceId: app.matrix.deviceId,
-        model: app.modelId,
+        model: app.engine?.modelId || app.modelId, // the weights actually loaded, never the picker alone
+        queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
         ua: navigator.userAgent,
         leaseUntil: app.leaseUntil,
@@ -735,6 +1231,14 @@ async function onWorkerRtcMessage(peer, msg) {
     peer.send({ type: "error", id: msg.id, message: "compute lease expired — renew to keep serving" });
     return;
   }
+  // Model pin, enforced at the edge: a job naming a model this device
+  // isn't loaded with is refused loudly, never answered with the wrong
+  // weights. The router should have avoided this; this is the wall behind
+  // that wall.
+  if (msg.model && msg.model !== app.modelId) {
+    peer.send({ type: "error", id: msg.id, message: `model_mismatch: loaded with ${app.modelId}, job asked for ${msg.model}` });
+    return;
+  }
   const t0 = Date.now();
   try {
     const { text } = await app.engine.infer(
@@ -766,7 +1270,9 @@ function borrowNow() {
     return;
   }
   workerConsolePush(`▶ ${prompt}\n`);
-  peer.send({ type: "job", id: crypto.randomUUID(), prompt, temperature: 0.7, max_tokens: 1024 });
+  // model: null = any giver (shortest expected wait). A surface that needs
+  // a specific model sets it to that exact WebLLM id and the router pins it.
+  peer.send({ type: "job", id: crypto.randomUUID(), prompt, model: null, temperature: 0.7, max_tokens: 1024 });
 }
 
 function workerConsolePush(text) {
@@ -919,6 +1425,7 @@ function controllerView() {
 
   fleetCardEl = el("div", { class: "card", hidden: true }, [
     el("h2", { text: "Workers" }),
+    el("div", { class: "muted small", id: "siblings" }),
     el("ul", { class: "fleet", id: "fleet" }),
   ]);
 
@@ -969,6 +1476,28 @@ function controllerView() {
 }
 
 function renderFleet() {
+  // The organism view: every heimdall here is one animal. Same-account
+  // siblings merge load signal; allied accounts migrate work over coord
+  // links. Routing stays independent — no leader, no central queue — so
+  // this line is awareness, never control.
+  const sibEl = document.getElementById("siblings");
+  if (sibEl && app.matrix) {
+    const now = Date.now();
+    const ctrls = [...app.controllers.entries()].filter(([, c]) => now - c.at <= CONTROLLER_TTL_MS);
+    const parts = [];
+    if (app.ally) parts.push("ally mode — this room belongs to another account; contributing compute, accepting forwards");
+    if (ctrls.length) {
+      const ids = [String(app.matrix.deviceId), ...ctrls.map(([, c]) => String(c.deviceId)).filter(Boolean)];
+      const leader = electLeader(ids);
+      const allies = ctrls.filter(([, c]) => !c.sameAccount).length;
+      parts.push(`${ctrls.length + 1} heimdalls, one animal${allies ? ` (${allies} allied)` : ""} — display led by ${leader === String(app.matrix.deviceId) ? "you" : leader}`);
+    } else if (!app.ally) {
+      parts.push("sole heimdall on this fleet");
+    }
+    const coordOpen = [...app.coordPeers.values()].filter((c) => c.peer?.opened).length;
+    if (coordOpen) parts.push(`${coordOpen} coord link${coordOpen > 1 ? "s" : ""} open`);
+    sibEl.textContent = parts.join(" · ");
+  }
   const ul = document.getElementById("fleet");
   if (!ul) return;
   ul.replaceChildren();
@@ -980,7 +1509,9 @@ function renderFleet() {
     const h = rec.hello;
     const color = rec.status === "ready" ? "ok" : rec.status === "expired" ? "err" : rec.status === "lost" ? "err" : "warn";
     const name = h?.name || rec.device.userId;
-    const meta = h ? `${h.model || ""}` : `linking…`;
+    const queue = rec.queueDepth ? ` · queued ${rec.queueDepth}` : "";
+    const pace = app.route.meanMs[key] ? ` · ~${Math.round(app.route.meanMs[key] / 100) / 10}s avg` : "";
+    const meta = h ? `${h.model || ""}${queue}${pace}` : `linking…`;
     const l = ledgerOf(key);
     const credit = l.give || l.borrow
       ? ` · gave ${l.give} took ${l.borrow}`

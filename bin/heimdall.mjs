@@ -64,15 +64,15 @@ if (cmd === "login") {
   const creds = await credsFor();
   const roomId = flag("--room", has("--new") ? "" : state.roomId);
   const name = flag("--name", creds.userId);
-  const { url, code, exp, roomId: rid } = await createInvite({ baseUrl, creds, roomId, displayName: name, site: SITE });
+  const { url, exp, roomId: rid } = await createInvite({ baseUrl, creds, roomId, displayName: name, site: SITE });
   save({ creds, roomId: rid });
   console.log("INVITE   " + url);
-  console.log("CODE     " + code);
   console.log("ROOM     " + rid);
   console.log("HOST     " + creds.userId);
   console.log("EXPIRES  " + new Date(exp).toISOString());
   console.log("");
-  console.log("send the invite link and the 6-digit code to the worker SEPARATELY.");
+  console.log("the 6-digit pairing code lives on the WORKER's device (its key fingerprint) —");
+  console.log("have them read it to you, then Record it in the controller site (or fold).");
   console.log("keep the controller site open and signed into " + creds.userId + " so codes can be confirmed.");
 } else if (cmd === "reset") {
   save({});

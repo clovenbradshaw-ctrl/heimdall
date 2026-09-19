@@ -149,11 +149,52 @@ npm run dev
 
 ## Limits (by design, for now)
 
-- WebRTC is **star topology**: controller ↔ each worker. No worker-to-worker mesh yet.
+- WebRTC is **star topology**: controller ↔ each worker, plus controller ↔
+  controller coord links. No worker-to-worker mesh yet.
 - **STUN only**, no TURN server: peers behind a strict symmetric NAT may not connect.
 - WebLLM wants **WebGPU**. Without it the worker shows a warning and inference
   will be slow or unavailable.
 - One model per worker (selectable before accepting).
+
+## One animal, many heimdalls
+
+Several heimdalls may share one fleet room — the same account open on many
+surfaces (site + CLI + fold), or allied accounts controlling together. They
+coordinate as a superorganism, with no leader and no central queue:
+
+- **Presence.** Every controller announces itself (`hello-controller`,
+  heartbeated) and the fleet card shows the organism: how many heimdalls,
+  which are allies, how many coord links are open.
+- **Model-aware routing.** A job naming a model only lands on a giver loaded
+  with that exact model — otherwise it fails loudly, never as a quiet
+  wrong-model answer. Unpinned jobs take the shortest expected wait
+  (in-flight × measured mean, unmeasured tried rather than starved).
+- **Shared load.** Same-account siblings merge inflight/pace snapshots;
+  every worker reports its own queue depth, so a giver busy with another
+  heimdall's jobs steers the next one away — including across accounts,
+  authenticated by the worker itself.
+- **Migration.** A borrow no local giver can serve is offered to a sibling
+  that advertises the model, over a controller-to-controller DataChannel,
+  settled per hop so every link earns/owes symmetric. One hop max, replays
+  refused, timeouts loud.
+- **Ally mode.** A controller that didn't create the room can't link workers
+  (they answer their creator's devices only) and stops trying — it lends
+  its own device and accepts forwards.
+- **Trust boundary: the account.** Same-user snapshots steer routing;
+  strangers' serves lists only ever attract a forward they must actually
+  serve. Credit ledgers stay pairwise (reciprocity needs no center).
+
+Verify it: `node --test src/route.test.mjs src/swarm.test.mjs` (19 cases),
+`node scripts/stress-route.mjs` (60 concurrent surfaces × models × two
+heimdalls, migration, per-hop settlement), and
+`node scripts/falsify-route.mjs` (8000 fuzzed picks against the router's
+invariants plus adversarial envelopes, replays, and garbage input —
+controls built to fail, per the project's own II.23), and
+`node scripts/measure-routing.mjs` (the A/B that prices the work:
+model-blind round-robin vs the new router on the same seeded bursts —
+wrong-model 12–15 → 0 with all 30 served, free-job avg 8840 → 3667ms
+(−59%), Qwen-only origin serving 10 Llama jobs via migration instead of
+failing all ten).
 
 ## Next steps
 

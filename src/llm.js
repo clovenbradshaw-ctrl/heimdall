@@ -18,6 +18,7 @@ export class WorkerEngine {
     this.engine = null;
     this.modelId = null;
     this.queue = Promise.resolve();
+    this.pending = 0; // jobs enqueued and unanswered — the backpressure signal other heimdalls read
     this.onProgress = onProgress || (() => {});
   }
 
@@ -38,7 +39,12 @@ export class WorkerEngine {
 
   infer(messages, opts = {}, onToken) {
     const run = () => this._run(messages, opts, onToken);
+    this.pending++;
     const task = this.queue.then(run);
+    task.then(
+      () => { this.pending = Math.max(0, this.pending - 1); },
+      () => { this.pending = Math.max(0, this.pending - 1); },
+    );
     this.queue = task.then(() => {}, () => {});
     return task;
   }
