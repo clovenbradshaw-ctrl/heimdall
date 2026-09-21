@@ -262,6 +262,86 @@ li.worker:last-child {
   word-break: break-word;
 }
 
+.streams {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin-top: 10px;
+}
+
+.run {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-head {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.stream {
+  background: #06080d;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.stream-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stream-head .name {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.stream-head .status.err {
+  color: var(--err);
+}
+
+.stream-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 14px;
+}
+
+.caret {
+  color: var(--accent);
+  animation: caret-blink 1s steps(1) infinite;
+}
+
+.stream.done .caret {
+  animation: none;
+  opacity: 0;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.run-note {
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.stream.err .run-note {
+  color: var(--err);
+}
+
 .badge {
   display: inline-block;
   font-size: 11px;

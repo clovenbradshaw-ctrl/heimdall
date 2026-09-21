@@ -65,6 +65,7 @@ const app = {
   pendingVerify: null,
   ledger: new Map(), // deviceKey -> { give, borrow }
   relay: new Map(), // job id -> { giverKey, borrowerKey, borrowerRec, t0, model }
+  runs: new Map(), // broadcast run id -> { rootEl, headEl, streams: Map(wkey -> stream rec) }
   route: { inflight: {}, meanMs: {}, idx: 0 }, // bifrost evidence: measured wait per giver
   siblings: new Map(), // same-account heimdall deviceKey -> { at, deviceId, inflight, meanMs }
   controllers: new Map(), // every announced heimdall deviceKey -> { at, deviceId, userId, serves, sameAccount }
@@ -531,9 +532,11 @@ function onWorkerMessage(key, rec, msg) {
     if (Number.isFinite(msg.queueDepth)) rec.queueDepth = Math.max(0, msg.queueDepth);
     if (msg.model && rec.hello) rec.hello.model = msg.model;
   } else if (msg.type === "token") {
-    consolePush(msg.id, msg.text);
+    // A broadcast run's tokens land in the worker's own stream block, so
+    // "run on all" stays readable instead of one interleaved soup.
+    pushRunToken(msg.id, key, msg.text);
   } else if (msg.type === "result") {
-    consolePush(msg.id, `\n[done ${msg.duration_ms}ms]\n`);
+    finishRunStream(msg.id, key, `[done ${msg.duration_ms}ms]`, true);
     rec.lastSeen = Date.now();
     noteObserved(key, msg.duration_ms ?? null, true);
     // The hub borrowed from this worker — it gave compute. Credit it.
@@ -543,7 +546,7 @@ function onWorkerMessage(key, rec, msg) {
     pushCredit(key, l);
     renderFleet();
   } else if (msg.type === "error") {
-    consolePush(msg.id, `\n[error] ${msg.message}\n`);
+    finishRunStream(msg.id, key, `[error] ${msg.message}`, false);
     // A model_mismatch here means the broadcast label drifted or the
     // worker swapped models mid-lease — free the slot, keep the mean.
     noteObserved(key, null, false);
@@ -934,7 +937,7 @@ function sendInferAll() {
   const prompt = promptEl.value.trim();
   if (!prompt) return;
   const id = crypto.randomUUID();
-  consolePush(id, `▶ ${prompt}\n`);
+  const run = beginRun(id, prompt);
   // A broadcast fans out to every eligible giver (each model answers in
   // its own voice — that IS the experiment). Per-target inflight is
   // tracked so the next borrowed job sees the real load.
@@ -951,11 +954,13 @@ function sendInferAll() {
         max_tokens: 1024,
       });
       app.route.inflight = routeMarkSent(app.route.inflight, wkey);
+      openRunStream(id, wkey, rec.hello?.name || rec.device.userId, rec.hello?.model ?? null);
       sent++;
     }
   }
   const self = selfGiver();
   if (self) {
+    openRunStream(id, "self", "you (this device)", self.model);
     const req = {
       type: "infer",
       id: `self:${id}`,
@@ -967,24 +972,99 @@ function sendInferAll() {
     };
     app.route.inflight = routeMarkSent(app.route.inflight, "self");
     const t0 = Date.now();
-    app.hubEngine.infer(req.messages, { stream: true, temperature: 0.7, max_tokens: 1024 }, (d) => consolePush(id, d))
+    app.hubEngine
+      .infer(req.messages, { stream: true, temperature: 0.7, max_tokens: 1024 }, (d) => pushRunToken(id, "self", d))
       .then(({ text }) => {
         noteObserved("self", Date.now() - t0, true);
-        consolePush(id, `\n[self done ${Date.now() - t0}ms]\n`);
+        finishRunStream(id, "self", `[done ${Date.now() - t0}ms]`, true);
       })
       .catch((e) => {
         noteObserved("self", Date.now() - t0, false);
-        consolePush(id, `\n[self error] ${e?.message || e}\n`);
+        finishRunStream(id, "self", `[error] ${e?.message || e}`, false);
       });
     sent++;
   }
-  if (!sent) toast("no live workers connected");
+  if (!sent) {
+    run.headEl.append(el("span", { class: "muted", text: " — no live workers connected" }));
+    endRun(id);
+    toast("no live workers connected");
+  }
 }
 
-function consolePush(id, text) {
-  if (!consoleEl) return;
-  consoleEl.textContent += text;
-  consoleEl.scrollTop = consoleEl.scrollHeight;
+/* -------------------------------------------------------- run streams */
+
+/** Every broadcast run gets a group: a muted prompt header, then one
+ *  streaming block per giver. Tokens land in the block for the worker that
+ *  sent them — a live cursor marks the one still writing. */
+function beginRun(id, prompt) {
+  const run = { id, streams: new Map() };
+  const rootEl = el("div", { class: "run" });
+  const headEl = el("div", { class: "run-head", text: `▶ ${prompt}` });
+  run.rootEl = rootEl;
+  run.headEl = headEl;
+  rootEl.append(headEl);
+  streamsEl.append(rootEl);
+  app.runs.set(id, run);
+  streamsEl.scrollTop = streamsEl.scrollHeight;
+  return run;
+}
+
+function openRunStream(runId, wkey, label, model) {
+  const run = app.runs.get(runId);
+  if (!run) return null;
+  const existing = run.streams.get(wkey);
+  if (existing) return existing;
+  const head = el("div", { class: "stream-head" }, [
+    statusDot("busy", "streaming"),
+    el("span", { class: "name", text: label }),
+    model ? el("span", { class: "badge", text: model }) : null,
+    el("span", { class: "status", text: "streaming…" }),
+  ]);
+  const body = el("div", { class: "stream-body" });
+  const caret = el("span", { class: "caret", text: "▌" });
+  body.append(caret);
+  const stream = el("div", { class: "stream" }, [head, body]);
+  run.rootEl.append(stream);
+  const rec = { stream, head, body, caret };
+  run.streams.set(wkey, rec);
+  streamsEl.scrollTop = streamsEl.scrollHeight;
+  return rec;
+}
+
+function pushRunToken(runId, wkey, text) {
+  const run = app.runs.get(runId);
+  const rec = run?.streams.get(wkey);
+  if (!rec) return;
+  // Insert ahead of the caret so the cursor always rides the latest token.
+  rec.caret.insertAdjacentText("beforebegin", text);
+  streamsEl.scrollTop = streamsEl.scrollHeight;
+}
+
+function finishRunStream(runId, wkey, note, ok) {
+  const run = app.runs.get(runId);
+  const rec = run?.streams.get(wkey);
+  if (!rec) return;
+  rec.stream.classList.add("done");
+  rec.stream.classList.add(ok ? "ok" : "err");
+  rec.caret.remove();
+  rec.body.append(el("div", { class: "run-note", text: note }));
+  const dot = rec.stream.querySelector(".dot");
+  if (dot) dot.className = `dot ${ok ? "dot-ok" : "dot-err"}`;
+  const status = rec.stream.querySelector(".status");
+  if (status) status.textContent = ok ? "done" : "failed";
+  streamsEl.scrollTop = streamsEl.scrollHeight;
+  let open = 0;
+  for (const [, s] of run.streams) if (!s.stream.classList.contains("done")) open++;
+  if (open === 0) endRun(runId);
+}
+
+function endRun(runId) {
+  app.runs.delete(runId);
+}
+
+function clearRuns() {
+  app.runs.clear();
+  streamsEl.textContent = "";
 }
 
 /* ---------------------------------------------------------------- worker */
@@ -1307,7 +1387,7 @@ async function keepAwake() {
 
 /* ------------------------------------------------------------------- view */
 
-let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, consoleEl, lendBtnEl, lendStatusEl;
+let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, streamsEl, lendBtnEl, lendStatusEl;
 let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, codeEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
 function header() {
@@ -1430,15 +1510,15 @@ function controllerView() {
   ]);
 
   promptEl = el("textarea", { placeholder: "send a prompt to every connected worker…" });
-  consoleEl = el("div", { class: "console", text: "" });
+  streamsEl = el("div", { class: "streams" });
   promptCardEl = el("div", { class: "card", hidden: true }, [
     el("h2", { text: "Run" }),
     promptEl,
     el("div", { class: "row" }, [
       el("button", { class: "primary", text: "Run on all workers", onclick: sendInferAll }),
-      el("button", { class: "ghost small", text: "clear log", onclick: () => (consoleEl.textContent = "") }),
+      el("button", { class: "ghost small", text: "clear log", onclick: clearRuns }),
     ]),
-    consoleEl,
+    streamsEl,
   ]);
 
   lendBtnEl = el("button", {
