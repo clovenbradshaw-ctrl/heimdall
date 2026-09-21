@@ -34,7 +34,10 @@ import { answers, normalizeTag, ollamaTagOf } from "./models.js";
 // to about once a minute, so the bridge also pings over the open event stream
 // (an event handler, which is not throttled) and the tab answers with its
 // state. Fresh = heard within this long.
-const TAB_FRESH_MS = 30_000;
+// The open stream itself is the liveness (the browser closes it with the
+// tab); the posted state only has to be recent enough to trust its list of
+// ready phones, and a throttled tab still posts once a minute.
+const TAB_FRESH_MS = 5 * 60_000;
 const PING_MS = 10_000;
 const FIRST_TOKEN_MS = 180_000; // a phone's cold first token (model already loaded) — then fall through
 const IDLE_MS = 120_000; // silence mid-stream this long ends the job
