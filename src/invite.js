@@ -1,8 +1,10 @@
 import { createClient } from "matrix-js-sdk";
 import { registerAuto, randomUsername, sha256Hex, getAccountData, setAccountData } from "./matrix.js";
+import { revokeEntry, withRevoked, withoutRevoked } from "./liveness.js";
 
 export const CODE_TYPE = "org.heimdall.codes";
 export const KEYS_TYPE = "org.heimdall.keys";
+export const REVOKED_TYPE = "org.heimdall.revoked";
 export const INVITE_TTL = 7 * 24 * 3600 * 1000;
 
 export function makeSecretCode() {
@@ -125,6 +127,38 @@ export async function recordPairedKey({ creds, userId, deviceId, pubKey }) {
   const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && k.deviceId === deviceId));
   paired.push({ userId, deviceId, pubKey, at: Date.now() });
   await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
+}
+
+/** Forget a device's pairing so a re-join must prove the code again. */
+export async function forgetPairedKey({ creds, userId, deviceId = null }) {
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && (deviceId == null || k.deviceId === deviceId)));
+  await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
+}
+
+/* ------------------------------------------------------- revoked devices
+   The account-wide list of devices the host has removed. Every surface
+   signed into the controller account (site, CLI, fold) reads it before
+   offering a link, so a removed device stays removed no matter which
+   heimdall is watching the room. deviceId null = the whole user. */
+
+export async function revokedList({ creds }) {
+  const reg = await getAccountData({ ...creds, type: REVOKED_TYPE }).catch(() => null);
+  return Array.isArray(reg?.revoked) ? reg.revoked : [];
+}
+
+export async function revokeDevice({ creds, userId, deviceId = null, reason = "" }) {
+  const list = await revokedList({ creds });
+  const next = withRevoked(list, revokeEntry({ userId, deviceId, reason }));
+  await setAccountData({ ...creds, type: REVOKED_TYPE, content: { revoked: next } });
+  return next;
+}
+
+export async function unrevokeDevice({ creds, userId, deviceId = null }) {
+  const list = await revokedList({ creds });
+  const next = withoutRevoked(list, { userId, deviceId });
+  await setAccountData({ ...creds, type: REVOKED_TYPE, content: { revoked: next } });
+  return next;
 }
 
 export async function pairedKeyFor({ creds, userId, deviceId }) {

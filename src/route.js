@@ -29,6 +29,8 @@
 // alpha 0.4 — huginn's own weight). Failures drop in-flight without moving
 // the mean, so a flaky giver sheds load without poisoning its score.
 
+import { STALE_AFTER_MS } from "./liveness.js";
+
 export const EWMA_ALPHA = 0.4;
 
 /** A job naming `room:@who:server model` is a remote Matrix mouth, not a
@@ -45,6 +47,9 @@ export function isEligible(rec, now = Date.now()) {
   if (rec.status !== "ready") return false;
   if (!rec.peer?.opened) return false;
   if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil) return false;
+  // A horse not heard from in 3 pings is stale: shown, never routed to
+  // (liveness.js). Unknown lastSeen is not silence — legacy records pass.
+  if (rec.lastSeen != null && now - rec.lastSeen >= STALE_AFTER_MS) return false;
   return true;
 }
 

@@ -137,10 +137,27 @@ npm install
 npm run dev
 ```
 
+## Removing a device
+
+Every worker row has **remove** (kick from the room, revoke this device) and
+**ban** (ban from the room, revoke every device of that account). Removal is
+enforced by three bodies at once: the homeserver (room membership), the
+controller account (`org.heimdall.revoked` account data, consulted before any
+link is offered — from any surface signed into the account), and the worker
+itself (a `revoked` notice and its own membership change stop it serving
+immediately and forget its pairing). Removed devices are listed under Workers
+with a **restore** button; a restored device must open the link and prove its
+code again.
+
 ## How it stays up
 
 - The worker keeps the screen awake (Wake Lock) and pings the controller every
   15s over the DataChannel.
+- The controller derives each horse's standing from the last ping, never from
+  the channel alone (`src/liveness.js`): 3 missed pings → **stale** (shown,
+  never routed to), 6 → **dead** (link torn down and re-offered through
+  Matrix). A never-heard device is *linking*, not dead. A worker that
+  re-announces while its old record is stale is relinked at once.
 - The controller re-negotiates any peer that drops, and periodically scans the
   room for new member devices.
 - If a device's tab is suspended (iOS especially), it reconnects automatically
@@ -184,7 +201,7 @@ coordinate as a superorganism, with no leader and no central queue:
   strangers' serves lists only ever attract a forward they must actually
   serve. Credit ledgers stay pairwise (reciprocity needs no center).
 
-Verify it: `node --test src/route.test.mjs src/swarm.test.mjs` (19 cases),
+Verify it: `node --test src/*.test.mjs` (29 cases: routing, swarm, liveness, revocation),
 `node scripts/stress-route.mjs` (60 concurrent surfaces × models × two
 heimdalls, migration, per-hop settlement), and
 `node scripts/falsify-route.mjs` (8000 fuzzed picks against the router's
@@ -195,6 +212,13 @@ model-blind round-robin vs the new router on the same seeded bursts —
 wrong-model 12–15 → 0 with all 30 served, free-job avg 8840 → 3667ms
 (−59%), Qwen-only origin serving 10 Llama jobs via migration instead of
 failing all ten).
+
+## Many servers
+
+See [MULTI-SERVER.md](MULTI-SERVER.md) — the 2026-09-21 pass on keeping horses
+running across many controllers, headless servers, and homeservers: what is
+wired, the one wall (workers answer only the room creator), and the ordered
+next steps with the control that would falsify each.
 
 ## Next steps
 

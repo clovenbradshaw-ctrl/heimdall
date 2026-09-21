@@ -26,7 +26,7 @@ export function deviceKey(d) {
  * that all flows over the WebRTC DataChannel.
  */
 export class MatrixPeer {
-  constructor({ baseUrl, userId, accessToken, deviceId, cryptoPrefix, onSignal, onSync, onMembers }) {
+  constructor({ baseUrl, userId, accessToken, deviceId, cryptoPrefix, onSignal, onSync, onMembers, onMyMembership }) {
     this.baseUrl = baseUrl;
     this.userId = userId;
     this.deviceId = deviceId;
@@ -35,6 +35,7 @@ export class MatrixPeer {
     this.onSignal = onSignal || (() => {});
     this.onSync = onSync || (() => {});
     this.onMembers = onMembers || (() => {});
+    this.onMyMembership = onMyMembership || (() => {});
 
     this.client = createClient({ baseUrl, userId, accessToken, deviceId });
 
@@ -48,10 +49,15 @@ export class MatrixPeer {
       this.onSignal(event.getSender(), event.getContent());
     });
     this.client.on(RoomStateEvent.Members, (event, state) => {
-      if (state.roomId === this.roomId) this.onMembers();
+      if (state.roomId === this.roomId) this.onMembers(event);
     });
-    this.client.on(RoomEvent.MyMembership, (room, membership) => {
+    // Our own membership moving is how a worker learns it was removed:
+    // a kick lands as "leave", a ban as "ban" — both from the homeserver,
+    // which no forged to-device message can fake.
+    this.client.on(RoomEvent.MyMembership, (room, membership, prev) => {
+      if (room?.roomId !== this.roomId) return;
       if (membership === KnownMembership.Join) this.onMembers();
+      this.onMyMembership(membership, prev);
     });
   }
 
@@ -91,6 +97,41 @@ export class MatrixPeer {
       .getJoinedMembers()
       .map((m) => m.userId)
       .filter((id) => id !== this.userId);
+  }
+
+  /** Our own membership in the fleet room: join | leave | ban | invite | null. */
+  myMembership() {
+    const room = this.client.getRoom(this.roomId);
+    return room ? room.getMyMembership() : null;
+  }
+
+  /** Members the homeserver currently bans from the fleet room. */
+  bannedMembers() {
+    const room = this.client.getRoom(this.roomId);
+    if (!room) return [];
+    return room.getMembersWithMembership(KnownMembership.Ban).map((m) => m.userId);
+  }
+
+  /* Removal is a room-state act, enforced by the homeserver for every
+     surface that ever reads the room. kick = leave now (the public link
+     lets them back in); ban = leave and stay out until unban. The
+     controller pairs either with a revoked-device entry on its account
+     (invite.js) so its own reconcile never re-offers a link. */
+  async kick(userId, reason = "removed by the host") {
+    await this.client.kick(this.roomId, userId, reason);
+  }
+
+  async ban(userId, reason = "banned by the host") {
+    await this.client.ban(this.roomId, userId, reason);
+  }
+
+  async unban(userId) {
+    await this.client.unban(this.roomId, userId);
+  }
+
+  async leaveRoom() {
+    if (!this.roomId) return;
+    await this.client.leave(this.roomId);
   }
 
   roomCreator() {

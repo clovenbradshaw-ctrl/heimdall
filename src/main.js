@@ -13,6 +13,7 @@ import { RtcPeer } from "./rtc.js";
 import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
 import { pickGiver as routePickGiver, observe as routeObserve, markSent as routeMarkSent, isRoomMouth, mergeInflight, mergeMeanMs, electLeader, SIBLING_TTL_MS } from "./route.js";
 import { amAlly, servesOf, pruneControllers, pickForwarder, makeFwdJob, validFwdJob, controllerKey, CONTROLLER_TTL_MS, FWD_TTL } from "./swarm.js";
+import { standingOf, shouldRelink, isRevoked } from "./liveness.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
 import {
   generateDeviceKeyPair,
@@ -26,6 +27,10 @@ import {
   importPublicKeyB64,
   verifyText,
   recordPairedKey,
+  forgetPairedKey,
+  revokedList,
+  revokeDevice,
+  unrevokeDevice,
 } from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
@@ -78,7 +83,13 @@ const app = {
   lendDevice: false,
   hubEngine: null,
   credit: { give: 0, borrow: 0, credit: 0 },
+  revoked: [], // controller: the account's revoked-device registry (invite.js REVOKED_TYPE)
+  revokedAt: 0, // when it was last read from the account
+  reconcileTimer: null, // exactly one reconcile loop per page, however many times we (re)join
+  removed: null, // worker: { reason, via } once the host removed this device
 };
+
+const REVOKED_REFRESH_MS = 60_000;
 
 /* ---------------------------------------------------------------- storage */
 
@@ -126,6 +137,14 @@ async function ensureMatrix() {
     onSync: () => {},
     onMembers: () => {
       if (mode === "controller") reconcile();
+    },
+    onMyMembership: (membership, prev) => {
+      // The homeserver moved us out of the room: a kick reads "leave", a
+      // ban "ban". Only the room itself can say this — it is the one
+      // removal signal a worker trusts without checking the sender.
+      if (mode === "worker" && prev === "join" && (membership === "leave" || membership === "ban")) {
+        onRemoved(membership === "ban" ? "banned from the fleet room" : "removed from the fleet room", "room");
+      }
     },
   });
   app.matrix = matrix;
@@ -202,7 +221,18 @@ async function onSignal(senderUserId, content) {
       peer.handleSignal(content.label, content.data).catch(() => {});
     }
   } else if (content.type === "ready" && mode === "controller") {
+    // A horse announcing itself while we hold a stale, dead, or lost
+    // record for it: the old link is a husk. Drop it so reconcile
+    // re-offers — the phone woke up, the tab came back, the NAT moved.
+    const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
+    const rec = app.workers.get(key);
+    if (rec && standingOf(rec) !== "ready" && standingOf(rec) !== "linking") dropWorker(key);
     reconcile();
+  } else if (content.type === "revoked" && mode === "worker") {
+    // Courtesy notice from the host (creator only); the room membership
+    // change is the authoritative one and arrives on its own.
+    if (app.creatorId && senderUserId !== app.creatorId) return;
+    onRemoved(content.reason || "removed by the host", "signal");
   } else if (content.type === "verify" && mode === "controller") {
     // The worker proves the pairing. We verify the whole chain before
     // confirming — nothing can be faked without the private key:
@@ -287,7 +317,7 @@ async function createRoom() {
     promptCardEl.hidden = false;
     refreshShareBox();
     toast("fleet room ready — send the link");
-    setInterval(() => reconcile(), 15000);
+    startReconcile();
     await reconcile();
   } catch (e) {
     toast(`could not create room: ${e.message}`);
@@ -304,7 +334,7 @@ async function rejoin() {
     promptCardEl.hidden = false;
     refreshShareBox();
     toast("rejoined fleet");
-    setInterval(() => reconcile(), 15000);
+    startReconcile();
     await reconcile();
   } catch (e) {
     toast(`could not rejoin: ${e.message}`);
@@ -331,8 +361,37 @@ async function lendMyDevice() {
   }
 }
 
+/** One loop, however many times createRoom/rejoin run in a page's life. */
+function startReconcile() {
+  if (app.reconcileTimer) return;
+  app.reconcileTimer = setInterval(() => reconcile(), 15000);
+}
+
+/** Read the account's revoked-device registry, at most once a minute. Any
+ *  surface on this account (site, CLI, fold) may have revoked since. */
+async function refreshRevoked(force = false) {
+  if (!app.session?.creds) return app.revoked;
+  if (!force && Date.now() - app.revokedAt < REVOKED_REFRESH_MS) return app.revoked;
+  try {
+    app.revoked = await revokedList({ creds: app.session.creds });
+    app.revokedAt = Date.now();
+  } catch { /* keep the last list; never re-offer on a failed read */ }
+  return app.revoked;
+}
+
+/** Tear one worker's link down and forget it, so the next reconcile
+ *  re-offers from scratch (or never does, if revoked). */
+function dropWorker(key) {
+  const rec = app.workers.get(key);
+  try { rec?.peer?.close(); } catch {}
+  app.workers.delete(key);
+  app.connecting.delete(key);
+  renderFleet();
+}
+
 async function reconcile() {
   if (!app.matrix || !app.roomId) return;
+  await refreshRevoked();
   // Ally mode: this room belongs to another account, so its workers will
   // never answer our offers (they serve their creator's devices only).
   // Don't storm them — contribute the lent device, accept forwards.
@@ -344,6 +403,7 @@ async function reconcile() {
       const devs = await app.matrix.devicesOf(userId, { retry: 0 });
       for (const device of devs) {
         const key = deviceKey(device);
+        if (isRevoked(app.revoked, device)) continue; // removed stays removed
         if (app.workers.has(key)) continue;
         const last = app.connecting.get(key) || 0;
         if (Date.now() - last < 30000) continue;
@@ -456,6 +516,9 @@ function ensureWorkerLink(key, device) {
       rec.status = "lost";
       renderFleet();
       const retry = setTimeout(() => {
+        // Only reap OUR record: a relink may already hold a new one under
+        // this key (dropWorker + reconcile run inside 5s).
+        if (app.workers.get(key) !== rec) return;
         app.workers.delete(key);
         app.connecting.delete(key);
         reconcile();
@@ -928,6 +991,66 @@ function serveForwarded(siblingKey, env) {
   else giver.rec.peer.send(req);
 }
 
+/* ------------------------------------------------------ removal, via matrix
+   Removing a horse is three acts, each enforced by a different body:
+     1. the ROOM — kick (leave now; the public link lets them back in) or
+        ban (out until unban). The homeserver enforces it for every surface.
+     2. the ACCOUNT — a revoked-device entry every controller on this account
+        consults before offering a link, plus the pairing is forgotten so a
+        return must prove its code again.
+     3. the LINK — a courtesy "revoked" notice, the channel closed, the
+        record dropped. The worker stops serving at once, not at next ping.
+   Order: link first (the notice must go while the link's Olm session is
+   warm), then account, then room. A failure in any later step is toasted,
+   never silent — the earlier steps have already stood the horse down. */
+async function removeWorker(key, { ban = false, reason = "" } = {}) {
+  const rec = app.workers.get(key);
+  if (!rec) return;
+  const { userId, deviceId } = rec.device;
+  const why = reason || (ban ? "banned by the host" : "removed by the host");
+  try {
+    if (rec.peer?.opened) rec.peer.send({ type: "revoked", reason: why });
+    await app.matrix?.sendSignalRetry(rec.device, { type: "revoked", deviceId: app.matrix.deviceId, reason: why }, 2);
+  } catch {}
+  dropWorker(key);
+  const creds = app.session?.creds;
+  if (creds) {
+    try {
+      // A ban revokes the user (every device); a kick revokes this device.
+      app.revoked = await revokeDevice({ creds, userId, deviceId: ban ? null : deviceId, reason: why });
+      app.revokedAt = Date.now();
+      await forgetPairedKey({ creds, userId, deviceId: ban ? null : deviceId });
+    } catch (e) {
+      toast(`revoked locally, but the account registry did not save: ${e.message}`);
+    }
+  }
+  try {
+    if (ban) await app.matrix.ban(userId, why);
+    else await app.matrix.kick(userId, why);
+    toast(`${ban ? "banned" : "removed"} ${userId}`);
+  } catch (e) {
+    toast(`${userId} dropped and revoked, but the room ${ban ? "ban" : "kick"} failed: ${e.message}`);
+  }
+  renderFleet();
+}
+
+/** Undo a removal: clear the registry entry, unban if banned. The device
+ *  still has to open the link and prove its code again — restoring trust
+ *  is never silent either. */
+async function restoreDevice(entry) {
+  const creds = app.session?.creds;
+  if (!creds) return;
+  try {
+    app.revoked = await unrevokeDevice({ creds, userId: entry.userId, deviceId: entry.deviceId ?? null });
+    app.revokedAt = Date.now();
+    if (app.matrix?.bannedMembers().includes(entry.userId)) await app.matrix.unban(entry.userId);
+    toast(`restored ${entry.userId}${entry.deviceId ? ` (${entry.deviceId})` : ""} — they must re-pair to serve again`);
+  } catch (e) {
+    toast(`could not restore: ${e.message}`);
+  }
+  renderFleet();
+}
+
 function nudgeRenew(key) {
   const rec = app.workers.get(key);
   if (rec?.peer?.opened) rec.peer.send({ type: "renew" });
@@ -1074,6 +1197,10 @@ function inviteExpired() {
 }
 
 async function acceptDuty() {
+  if (app.removed) {
+    toast(`this device was removed by the host (${app.removed.reason}) — ask for a fresh link and pair again`);
+    return;
+  }
   if (inviteExpired()) {
     toast(`this invite expired — ask ${share.name || "the host"} for a fresh link`);
     return;
@@ -1303,6 +1430,10 @@ async function onWorkerRtcMessage(peer, msg) {
     return;
   }
   if (msg.type !== "infer") return;
+  if (app.removed) {
+    peer.send({ type: "error", id: msg.id, message: `removed by the host — ${app.removed.reason}` });
+    return;
+  }
   if (!app.engine) {
     peer.send({ type: "error", id: msg.id, message: "engine not ready" });
     return;
@@ -1315,8 +1446,9 @@ async function onWorkerRtcMessage(peer, msg) {
   // isn't loaded with is refused loudly, never answered with the wrong
   // weights. The router should have avoided this; this is the wall behind
   // that wall.
-  if (msg.model && msg.model !== app.modelId) {
-    peer.send({ type: "error", id: msg.id, message: `model_mismatch: loaded with ${app.modelId}, job asked for ${msg.model}` });
+  const loaded = app.engine?.modelId || app.modelId; // the weights, never the picker alone
+  if (msg.model && msg.model !== loaded) {
+    peer.send({ type: "error", id: msg.id, message: `model_mismatch: loaded with ${loaded}, job asked for ${msg.model}` });
     return;
   }
   const t0 = Date.now();
@@ -1368,6 +1500,33 @@ function updateComposer() {
   borrowHintEl.textContent = can
     ? `credit ${app.credit.credit} — you can borrow`
     : "you have not given any compute yet — serve a job first, then you can borrow";
+}
+
+/** The host removed this device. Stand down at once: no lease, no serving,
+ *  no re-announce; forget the room pairing so a return must prove its code
+ *  again. `via` names which body said so — the room (authoritative) or a
+ *  to-device notice from the creator (courtesy, arrives first). */
+function onRemoved(reason, via) {
+  if (app.removed) return;
+  app.removed = { reason, via, at: Date.now() };
+  app.leaseUntil = 0;
+  app.leaseExpired = true;
+  app.renewRequested = false;
+  try {
+    localStorage.removeItem(`heimdall.lease.${app.roomId}`);
+    localStorage.removeItem(`heimdall.verified.${app.roomId}`);
+  } catch {}
+  for (const peer of app.peers.values()) {
+    try { peer.close(); } catch {}
+  }
+  app.peers.clear();
+  if (acceptBtnEl) {
+    acceptBtnEl.disabled = true;
+    acceptBtnEl.textContent = "Removed by the host";
+  }
+  if (statusEl) statusEl.textContent = `removed: ${reason}`;
+  renderWorkerStatus();
+  toast(`the host removed this device — ${reason}`);
 }
 
 async function keepAwake() {
@@ -1507,6 +1666,7 @@ function controllerView() {
     el("h2", { text: "Workers" }),
     el("div", { class: "muted small", id: "siblings" }),
     el("ul", { class: "fleet", id: "fleet" }),
+    el("div", { class: "col", id: "revoked" }),
   ]);
 
   promptEl = el("textarea", { placeholder: "send a prompt to every connected worker…" });
@@ -1587,7 +1747,8 @@ function renderFleet() {
   }
   for (const [key, rec] of app.workers) {
     const h = rec.hello;
-    const color = rec.status === "ready" ? "ok" : rec.status === "expired" ? "err" : rec.status === "lost" ? "err" : "warn";
+    const standing = standingOf(rec);
+    const color = standing === "ready" ? "ok" : standing === "stale" ? "warn" : standing === "linking" ? "warn" : "err";
     const name = h?.name || rec.device.userId;
     const queue = rec.queueDepth ? ` · queued ${rec.queueDepth}` : "";
     const pace = app.route.meanMs[key] ? ` · ~${Math.round(app.route.meanMs[key] / 100) / 10}s avg` : "";
@@ -1603,14 +1764,38 @@ function renderFleet() {
     });
     ul.append(
       el("li", { class: "worker" }, [
-        statusDot(color, rec.status),
+        statusDot(color, standing),
         el("div", { class: "who" }, [
           el("div", { class: "name", text: name }),
           el("div", { class: "meta", text: meta + credit }),
           el("div", { class: "meta", text: lastSeenText(rec.lastSeen) + (rec.renewed ? " · renewed" : "") }),
         ]),
         lease,
+        el("span", { class: "badge", text: standing }),
         el("button", { class: "ghost small", text: "renew", onclick: () => nudgeRenew(key) }),
+        el("button", { class: "ghost small", title: "kick from the room and revoke this device", text: "remove", onclick: () => removeWorker(key) }),
+        el("button", { class: "ghost small", title: "ban from the room and revoke every device of this account", text: "ban", onclick: () => removeWorker(key, { ban: true }) }),
+      ]),
+    );
+  }
+  renderRevoked();
+}
+
+/** The account's removed devices, with a way back. Read from the account
+ *  so a removal made on the CLI or the fold shows here too. */
+function renderRevoked() {
+  const box = document.getElementById("revoked");
+  if (!box) return;
+  box.replaceChildren();
+  const list = app.revoked || [];
+  if (!list.length) return;
+  box.append(el("div", { class: "muted small", text: `removed: ${list.length}` }));
+  for (const e of list) {
+    box.append(
+      el("div", { class: "row" }, [
+        el("span", { class: "badge err", text: e.deviceId == null ? "banned" : "removed" }),
+        el("span", { class: "small", text: `${e.userId}${e.deviceId ? ` · ${e.deviceId}` : " · every device"}${e.reason ? ` — ${e.reason}` : ""}` }),
+        el("button", { class: "ghost small", text: "restore", onclick: () => restoreDevice(e) }),
       ]),
     );
   }
@@ -1788,7 +1973,9 @@ function renderWorkerStatus() {
   const box = document.getElementById("worker-status");
   if (!box || !statusEl) return;
   const online = [...app.peers.values()].filter((p) => p.opened).length;
-  const leaseBadge = app.leaseExpired
+  const leaseBadge = app.removed
+    ? el("span", { class: "badge err", text: `removed by the host (${app.removed.via})` })
+    : app.leaseExpired
     ? el("span", { class: "badge err", text: "lease expired" })
     : app.leaseUntil
       ? el("span", { class: "countdown badge ok", "data-until": app.leaseUntil, text: `lease ${countdownText(app.leaseUntil)}` })
@@ -1797,7 +1984,7 @@ function renderWorkerStatus() {
     class: `badge ${app.credit.credit > 0 ? "ok" : "warn"}`,
     text: `credit ${app.credit.credit} (gave ${app.credit.give}, took ${app.credit.borrow})`,
   });
-  const renewBtn = app.leaseExpired || app.renewRequested
+  const renewBtn = !app.removed && (app.leaseExpired || app.renewRequested)
     ? el("button", { class: "primary small", text: "Renew now", onclick: acceptDuty })
     : null;
   const lines = [
@@ -1843,13 +2030,29 @@ function workerTick() {
 }
 
 function controllerTick() {
-  for (const rec of app.workers.values()) {
-    if (rec.hello?.leaseUntil && Date.now() > rec.hello.leaseUntil && rec.status !== "expired") {
+  const now = Date.now();
+  let changed = false;
+  for (const [key, rec] of app.workers) {
+    if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil && rec.status !== "expired") {
       rec.status = "expired";
-      nudgeRenew(deviceKey(rec.device));
-      renderFleet();
+      nudgeRenew(key);
+      changed = true;
+    }
+    // Liveness is derived from the last ping, never from the channel
+    // alone (liveness.js): a silent horse goes stale (shown, not routed),
+    // then dead (link torn down and re-offered through Matrix).
+    const standing = standingOf(rec, now);
+    if (standing !== rec.standing) {
+      rec.standing = standing;
+      changed = true;
+    }
+    if (shouldRelink(rec, now) && rec.status !== "lost") {
+      dropWorker(key);
+      reconcile();
+      changed = true;
     }
   }
+  if (changed) renderFleet();
 }
 
 /* ------------------------------------------------------------------ boot */
