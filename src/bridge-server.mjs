@@ -30,7 +30,12 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { answers, normalizeTag, ollamaTagOf } from "./models.js";
 
-const TAB_FRESH_MS = 20_000; // the tab posts its state every 5 s
+// The tab posts its state every 5 s — but a hidden tab's timers are throttled
+// to about once a minute, so the bridge also pings over the open event stream
+// (an event handler, which is not throttled) and the tab answers with its
+// state. Fresh = heard within this long.
+const TAB_FRESH_MS = 30_000;
+const PING_MS = 10_000;
 const FIRST_TOKEN_MS = 180_000; // a phone's cold first token (model already loaded) — then fall through
 const IDLE_MS = 120_000; // silence mid-stream this long ends the job
 
@@ -335,7 +340,7 @@ export function createBridge({
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
           res.write(": heimdall bridge\n\n");
           tabs.add(res);
-          const ka = setInterval(() => res.write(": ka\n\n"), 15000);
+          const ka = setInterval(() => res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`), PING_MS);
           req.on("close", () => { clearInterval(ka); tabs.delete(res); });
           log(`controller tab connected (${tabs.size} open)`);
           return;

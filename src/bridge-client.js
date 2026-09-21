@@ -31,6 +31,7 @@ export function connectBridge({ onJob, getState, onStatus = () => {} }) {
     let m;
     try { m = JSON.parse(e.data); } catch { return; }
     if (m?.type === "job") onJob(m);
+    else if (m?.type === "ping") pushState(); // answered from an event, so a background tab stays fresh
   };
 
   const pushState = () => post("bridge/state", getState()).catch(() => {});
