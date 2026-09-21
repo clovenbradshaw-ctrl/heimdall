@@ -24,17 +24,27 @@ export function connectBridge({ onJob, getState, onStatus = () => {} }) {
   const post = (path, body) =>
     fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
-  const es = new EventSource("bridge/events");
-  es.onopen = () => onStatus("connected");
-  es.onerror = () => onStatus("reconnecting");
-  es.onmessage = (e) => {
-    let m;
-    try { m = JSON.parse(e.data); } catch { return; }
-    if (m?.type === "job") onJob(m);
-    else if (m?.type === "ping") pushState(); // answered from an event, so a background tab stays fresh
+  // The stream down. A browser gives up on an EventSource for good after some
+  // failures (a bridge restart can cause one), so a closed stream is reopened
+  // from the state timer — the page never needs a reload to find the bridge.
+  let es = null;
+  const open = () => {
+    es = new EventSource("bridge/events");
+    es.onopen = () => onStatus("connected");
+    es.onerror = () => onStatus("reconnecting");
+    es.onmessage = (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m?.type === "job") onJob(m);
+      else if (m?.type === "ping") pushState(); // answered from an event, so a background tab stays fresh
+    };
   };
+  open();
 
-  const pushState = () => post("bridge/state", getState()).catch(() => {});
+  const pushState = () => {
+    if (es.readyState === EventSource.CLOSED) open();
+    return post("bridge/state", getState()).catch(() => {});
+  };
   const timer = setInterval(pushState, 5000);
   pushState();
 
