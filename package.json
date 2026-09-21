@@ -9,16 +9,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "icons": "node scripts/gen-icons.mjs",
-    "invite": "node bin/heimdall.mjs invite"
+    "invite": "node bin/heimdall.mjs invite",
+    "up": "node bin/heimdall.mjs up"
   },
   "bin": {
     "heimdall": "./bin/heimdall.mjs"
   },
   "dependencies": {
     "@mlc-ai/web-llm": "^0.2.85",
-    "matrix-js-sdk": "^42.4.0"
-  },
-  "devDependencies": {
+    "matrix-js-sdk": "^42.4.0",
+    "qrcode-generator": "^1.5.2",
     "vite": "^7.0.0"
   }
 }

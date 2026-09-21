@@ -10,8 +10,11 @@ import {
   sha256Hex,
 } from "./matrix.js";
 import { RtcPeer } from "./rtc.js";
-import { WorkerEngine, MODEL_CHOICES, DEFAULT_MODEL, webgpuAvailable } from "./llm.js";
-import { pickGiver as routePickGiver, observe as routeObserve, markSent as routeMarkSent, isRoomMouth, mergeInflight, mergeMeanMs, electLeader, SIBLING_TTL_MS } from "./route.js";
+import { WorkerEngine, OllamaEngine, MODEL_CHOICES, DEFAULT_MODEL, FALLBACK_MODEL, webgpuAvailable } from "./llm.js";
+import { answers, ollamaTagOf } from "./models.js";
+import { detectBridge, connectBridge } from "./bridge-client.js";
+import qrcode from "qrcode-generator";
+import { isEligible, modelOf, pickGiver as routePickGiver, observe as routeObserve, markSent as routeMarkSent, isRoomMouth, mergeInflight, mergeMeanMs, electLeader, SIBLING_TTL_MS } from "./route.js";
 import { amAlly, servesOf, pruneControllers, pickForwarder, makeFwdJob, validFwdJob, controllerKey, CONTROLLER_TTL_MS, FWD_TTL } from "./swarm.js";
 import { standingOf, shouldRelink, isRevoked } from "./liveness.js";
 import { el, statusDot, copyBtn, toast, deviceName, publicIp, countdownText } from "./ui.js";
@@ -31,9 +34,15 @@ import {
   revokedList,
   revokeDevice,
   unrevokeDevice,
+  ownPairedDevices,
 } from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
+const PUBLIC_SITE = "https://clovenbradshaw-ctrl.github.io/heimdall/";
+// The local bridge (`heimdall up`) borrows under this key. No worker's
+// deviceKey can equal it (those are "@user:hs|DEVICE"), so a worker can
+// never claim the bridge's exemption from the credit gate.
+const BRIDGE_KEY = "bridge";
 const SESSION_KEY = "heimdall.session.v1";
 const MODEL_KEY = "heimdall.model.v1";
 const NAME_KEY = "heimdall.name.v1";
@@ -47,6 +56,9 @@ const FOLD_CMD = `git clone ${FOLD_REPO} && cd the-fold && ./fold`;
 
 const share = parseShareUrl();
 const mode = share ? "worker" : "controller";
+// ?embed: the controller shown inside another page (the Fold's Heimdall
+// sheet) — just the pairing and the devices, none of the page chrome.
+const embed = new URLSearchParams(location.search).has("embed");
 
 const app = {
   mode,
@@ -54,6 +66,7 @@ const app = {
   roomId: share?.roomId || null,
   session: loadSession(),
   modelId: localStorage.getItem(MODEL_KEY) || DEFAULT_MODEL,
+  modelChosen: !!localStorage.getItem(MODEL_KEY), // the person picked it — never swapped for a fallback
   displayName: localStorage.getItem(NAME_KEY) || "",
   matrix: null,
   creatorId: null,
@@ -87,6 +100,11 @@ const app = {
   revokedAt: 0, // when it was last read from the account
   reconcileTimer: null, // exactly one reconcile loop per page, however many times we (re)join
   removed: null, // worker: { reason, via } once the host removed this device
+  bridge: null, // controller: the local bridge connection (bridge-client.js), when `heimdall up` serves this page
+  bridgeInfo: null,
+  ownDevices: new Set(), // controller: deviceKeys the host marked as their own (borrow without credit)
+  pendingPairs: new Map(), // controller: codeHash -> a verify that arrived before its code was recorded
+  own: false, // worker: the host marked this device as theirs
 };
 
 const REVOKED_REFRESH_MS = 60_000;
@@ -234,38 +252,11 @@ async function onSignal(senderUserId, content) {
     if (app.creatorId && senderUserId !== app.creatorId) return;
     onRemoved(content.reason || "removed by the host", "signal");
   } else if (content.type === "verify" && mode === "controller") {
-    // The worker proves the pairing. We verify the whole chain before
-    // confirming — nothing can be faked without the private key:
-    //   1. the presented code hash was actually recorded by us,
-    //   2. that code is the fingerprint of the presented PUBLIC key,
-    //   3. the signature is valid under that public key, over room+identity+code.
-    let ok = false;
-    try {
-      if (app.session?.creds) {
-        const creds = app.session.creds;
-        const recorded = await confirmCode({ creds, codeHash: content.codeHash });
-        if (recorded && content.pubKey && content.sig) {
-          const pubKey = await importPublicKeyB64(content.pubKey);
-          const fingerprint = await codeFromPublicKey(content.pubKey);
-          const fpMatches = (await sha256Hex(fingerprint)) === content.codeHash;
-          const payload = pairingPayload(app.roomId, senderUserId, content.deviceId, content.codeHash);
-          const sigOk = await verifyText(pubKey, payload, content.sig);
-          ok = fpMatches && sigOk;
-          if (ok) {
-            consumeCode({ creds, codeHash: content.codeHash }).catch(() => {});
-            recordPairedKey({ creds, userId: senderUserId, deviceId: content.deviceId, pubKey: content.pubKey }).catch(() => {});
-          }
-        }
-      }
-    } catch {}
-    const device = { userId: senderUserId, deviceId: content.deviceId };
-    app.matrix
-      ?.sendSignalRetry(device, { type: ok ? "verified" : "denied", deviceId: app.matrix.deviceId }, 3)
-      .then(() => {});
-    if (ok) toast(`paired ${senderUserId} — signature + code verified`);
-    else toast(`pairing refused for ${senderUserId} — code, key, or signature didn't check out`);
+    await verifyPairing(senderUserId, content);
   } else if (content.type === "verified" && mode === "worker") {
     if (app.creatorId && senderUserId !== app.creatorId) return;
+    if (content.own) app.own = true;
+    app.onAwaitingCode = null;
     if (app.pendingVerify) {
       const r = app.pendingVerify;
       app.pendingVerify = null;
@@ -273,6 +264,12 @@ async function onSignal(senderUserId, content) {
     }
   } else if (content.type === "denied" && mode === "worker") {
     if (app.creatorId && senderUserId !== app.creatorId) return;
+    // Not refused — the host just hasn't typed the code in yet. Keep
+    // waiting: the host re-checks this attempt the moment they record it.
+    if (content.reason === "unrecorded" && app.pendingVerify) {
+      app.onAwaitingCode?.();
+      return;
+    }
     if (app.pendingVerify) {
       const r = app.pendingVerify;
       app.pendingVerify = null;
@@ -283,12 +280,85 @@ async function onSignal(senderUserId, content) {
 
 /* ------------------------------------------------------------ controller */
 
+/** The worker proves the pairing. The whole chain is verified before
+ *  confirming — nothing can be faked without the private key:
+ *    1. the presented code hash was actually recorded by us,
+ *    2. that code is the fingerprint of the presented PUBLIC key,
+ *    3. the signature is valid under that public key, over room+identity+code.
+ *  A proof whose signature holds but whose code isn't recorded YET is kept:
+ *  the host typing the code in re-runs it (recordCode), so the phone never
+ *  has to press accept twice. */
+async function verifyPairing(senderUserId, content) {
+  let ok = false;
+  let recorded = null;
+  let sigHolds = false;
+  try {
+    if (app.session?.creds && content.pubKey && content.sig && content.codeHash) {
+      const creds = app.session.creds;
+      const pubKey = await importPublicKeyB64(content.pubKey);
+      const fingerprint = await codeFromPublicKey(content.pubKey);
+      const fpMatches = (await sha256Hex(fingerprint)) === content.codeHash;
+      const payload = pairingPayload(app.roomId, senderUserId, content.deviceId, content.codeHash);
+      sigHolds = fpMatches && (await verifyText(pubKey, payload, content.sig));
+      if (sigHolds) recorded = await confirmCode({ creds, codeHash: content.codeHash });
+      ok = sigHolds && !!recorded;
+      if (ok) {
+        const own = !!recorded.own;
+        consumeCode({ creds, codeHash: content.codeHash }).catch(() => {});
+        recordPairedKey({ creds, userId: senderUserId, deviceId: content.deviceId, pubKey: content.pubKey, own }).catch(() => {});
+        if (own) app.ownDevices.add(deviceKey({ userId: senderUserId, deviceId: content.deviceId }));
+      }
+    }
+  } catch {}
+  const device = { userId: senderUserId, deviceId: content.deviceId };
+  if (ok) {
+    app.pendingPairs.delete(content.codeHash);
+    app.matrix?.sendSignalRetry(device, { type: "verified", deviceId: app.matrix.deviceId, own: !!recorded?.own }, 3).then(() => {});
+    toast(`paired ${senderUserId} — signature + code verified`);
+    renderPendingPairs();
+    return true;
+  }
+  if (sigHolds && !recorded) {
+    app.pendingPairs.set(content.codeHash, { senderUserId, content, at: Date.now() });
+    app.matrix?.sendSignalRetry(device, { type: "denied", reason: "unrecorded", deviceId: app.matrix.deviceId }, 3).then(() => {});
+    renderPendingPairs();
+    toast("a device is waiting — type the code it shows");
+    return false;
+  }
+  app.matrix?.sendSignalRetry(device, { type: "denied", deviceId: app.matrix.deviceId }, 3).then(() => {});
+  toast(`pairing refused for ${senderUserId} — code, key, or signature didn't check out`);
+  return false;
+}
+
+/** Record a code the worker read out, then re-check any device already
+ *  waiting on it. */
+async function recordCode(code, own) {
+  await issueCode({ creds: app.session.creds, code, exp: Date.now() + INVITE_TTL, own });
+  const hash = await sha256Hex(code);
+  const waiting = app.pendingPairs.get(hash);
+  if (waiting) await verifyPairing(waiting.senderUserId, waiting.content);
+  return !!waiting;
+}
+
+function renderPendingPairs() {
+  const box = document.getElementById("pending-pairs");
+  if (!box) return;
+  const cut = Date.now() - 15 * 60_000;
+  for (const [h, p] of app.pendingPairs) if (p.at < cut) app.pendingPairs.delete(h);
+  const n = app.pendingPairs.size;
+  box.hidden = !n;
+  box.textContent = n ? `${n} device${n > 1 ? "s" : ""} waiting — type the 6-digit code shown on ${n > 1 ? "each" : "it"}` : "";
+}
+
 async function buildInviteUrl() {
   const name = app.displayName || app.matrix.userId;
   const exp = Date.now() + INVITE_TTL;
   app.invite = { name, exp };
   saveSession({ invite: app.invite });
-  const base = shareUrl(app.roomId, app.hs);
+  // Served by the local bridge, the page lives on localhost — a phone
+  // can't open that. Hand out the public site instead (same code).
+  const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  const base = shareUrl(app.roomId, app.hs, local ? app.bridgeInfo?.site || PUBLIC_SITE : undefined);
   // The 6-digit pairing code is generated on the WORKER's device and given to
   // you out of band; you record it to onboard them. It never rides in the link.
   return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}`;
@@ -304,6 +374,13 @@ async function refreshShareBox() {
   if (!shareBoxEl || !app.roomId) return;
   shareBoxEl.value = await buildInviteUrl();
   shareBoxEl.disabled = false;
+  if (qrEl) {
+    const qr = qrcode(0, "M");
+    qr.addData(shareBoxEl.value);
+    qr.make();
+    qrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 3, scalable: true });
+    qrEl.hidden = false;
+  }
   inviteExpiryEl.textContent = `link expires ${countdownText(app.invite.exp)} — renew to keep it alive`;
 }
 
@@ -341,6 +418,113 @@ async function rejoin() {
   }
 }
 
+/* ------------------------------------------------ the local bridge ----
+   When `heimdall up` serves this page, this computer's own callers
+   (eoreader7, anything that speaks Ollama) reach the fleet through it. */
+
+async function startBridge() {
+  const info = await detectBridge();
+  if (!info) return;
+  app.bridgeInfo = info;
+  app.bridgeJobs = 0;
+  app.bridge = connectBridge({
+    onJob: onBridgeJob,
+    getState: bridgeState,
+    onStatus: (st) => {
+      app.bridgeStatus = st;
+      renderBridge();
+    },
+  });
+  if (bridgeCardEl) bridgeCardEl.hidden = false;
+  if (ownBoxEl) ownBoxEl.checked = true; // it's your computer: devices you pair here are yours
+  renderBridge();
+  if (app.roomId) refreshShareBox();
+  // Running `heimdall up` is the ask for a fleet — make one if there is none.
+  if (!app.session?.roomId) await createRoom();
+  // Lend this computer's Ollama back, so a phone can borrow its GPU.
+  if (info.lendModel && !app.lendDevice) await lendOllama(info.lendModel);
+}
+
+function onBridgeJob(m) {
+  app.bridgeJobs++;
+  const rec = {
+    device: { userId: "this computer", deviceId: BRIDGE_KEY },
+    peer: { opened: true, send: (x) => app.bridge?.reply(x) },
+  };
+  onBorrowJob(BRIDGE_KEY, rec, {
+    type: "job",
+    id: m.id,
+    model: m.model,
+    messages: m.messages,
+    temperature: m.temperature,
+    max_tokens: m.max_tokens,
+  });
+  renderBridge();
+}
+
+/** What the bridge may promise its callers: who is ready, with what. */
+function bridgeState() {
+  const now = Date.now();
+  const workers = [...app.workers.entries()].map(([key, rec]) => ({
+    key,
+    name: rec.hello?.name || rec.device.userId,
+    model: modelOf(rec),
+    ctx: rec.hello?.ctx ?? null,
+    standing: standingOf(rec, now),
+    ready: isEligible(rec, now),
+  }));
+  const s = selfGiver();
+  // This tab lending WebLLM is one more giver the bridge may use; a lent
+  // Ollama is not (the bridge reaches Ollama directly).
+  if (s && !(app.hubEngine instanceof OllamaEngine)) {
+    workers.push({ key: "self", name: "this computer (browser)", model: s.model, ctx: app.hubEngine?.contextWindow ?? null, standing: "ready", ready: true });
+  }
+  return {
+    at: now,
+    room: app.roomId,
+    workers,
+    self: s ? { model: s.model, kind: app.hubEngine instanceof OllamaEngine ? "ollama" : "webllm" } : null,
+  };
+}
+
+let bridgePushAt = 0;
+function bridgeNudge() {
+  if (!app.bridge || Date.now() - bridgePushAt < 1000) return;
+  bridgePushAt = Date.now();
+  app.bridge.pushState();
+}
+
+async function lendOllama(tag) {
+  const eng = new OllamaEngine();
+  try {
+    await eng.load(tag);
+    app.hubEngine = eng;
+    app.lendDevice = true;
+    if (lendBtnEl) lendBtnEl.disabled = true;
+    if (lendStatusEl) lendStatusEl.textContent = `lending this computer's Ollama (${tag}) — your phone can borrow it`;
+    renderFleet();
+    renderBridge();
+  } catch (e) {
+    if (lendStatusEl) lendStatusEl.textContent = `could not lend Ollama: ${e.message}`;
+  }
+}
+
+function renderBridge() {
+  if (!bridgeStatusEl || !app.bridgeInfo) return;
+  const now = Date.now();
+  const ready = [...app.workers.values()].filter((r) => isEligible(r, now));
+  const tags = [...new Set(ready.map((r) => ollamaTagOf(modelOf(r)) || modelOf(r)).filter(Boolean))];
+  const lent = app.hubEngine instanceof OllamaEngine ? app.hubEngine.modelId : null;
+  bridgeStatusEl.replaceChildren(
+    el("div", { class: "row" }, [
+      el("span", { class: `badge ${app.bridgeStatus === "connected" ? "ok" : "warn"}`, text: `bridge ${app.bridgeStatus || "starting"}` }),
+      el("span", { class: `badge ${ready.length ? "ok" : ""}`, text: ready.length ? `${ready.length} device${ready.length > 1 ? "s" : ""} ready: ${tags.join(", ")}` : "no devices ready yet" }),
+      lent ? el("span", { class: "badge ok", text: `phones can borrow ${lent}` }) : null,
+      app.bridgeJobs ? el("span", { class: "badge", text: `${app.bridgeJobs} job${app.bridgeJobs > 1 ? "s" : ""} from this computer` }) : null,
+    ].filter(Boolean)),
+  );
+}
+
 async function lendMyDevice() {
   if (app.lendDevice) return;
   app.lendDevice = true;
@@ -376,6 +560,11 @@ async function refreshRevoked(force = false) {
     app.revoked = await revokedList({ creds: app.session.creds });
     app.revokedAt = Date.now();
   } catch { /* keep the last list; never re-offer on a failed read */ }
+  // Own devices ride the same account read, so a pairing made on another
+  // surface (or before a reload) still borrows freely here.
+  ownPairedDevices({ creds: app.session.creds })
+    .then((list) => { for (const d of list) app.ownDevices.add(deviceKey(d)); })
+    .catch(() => {});
   return app.revoked;
 }
 
@@ -551,6 +740,7 @@ function onWorkerMessage(key, rec, msg) {
   // A relayed job: worker borrowed from the fleet, tokens come back via the hub.
   if (msg.type === "token" && app.relay.has(msg.id)) {
     const r = app.relay.get(msg.id);
+    r.arm?.();
     if (r.borrowerRec?.peer?.opened) r.borrowerRec.peer.send({ type: "token", id: msg.id, text: msg.text });
     return;
   }
@@ -578,6 +768,7 @@ function onWorkerMessage(key, rec, msg) {
     rec.status = "ready";
     rec.lastSeen = Date.now();
     rec.queueDepth = Number.isFinite(msg.queueDepth) && msg.queueDepth > 0 ? msg.queueDepth : 0;
+    pushCredit(key, ledgerOf(key)); // tells an own device it may borrow now
     renderFleet();
   } else if (msg.type === "lease") {
     rec.hello = { ...(rec.hello || {}), leaseUntil: msg.until };
@@ -594,6 +785,7 @@ function onWorkerMessage(key, rec, msg) {
     // through exactly this number.
     if (Number.isFinite(msg.queueDepth)) rec.queueDepth = Math.max(0, msg.queueDepth);
     if (msg.model && rec.hello) rec.hello.model = msg.model;
+    if (msg.ctx && rec.hello) rec.hello.ctx = msg.ctx;
   } else if (msg.type === "token") {
     // A broadcast run's tokens land in the worker's own stream block, so
     // "run on all" stays readable instead of one interleaved soup.
@@ -627,7 +819,7 @@ function ledgerOf(key) {
 function pushCredit(key, l) {
   const rec = app.workers.get(key);
   if (rec?.peer?.opened) {
-    rec.peer.send({ type: "credit", give: l.give, borrow: l.borrow, credit: l.give - l.borrow });
+    rec.peer.send({ type: "credit", give: l.give, borrow: l.borrow, credit: l.give - l.borrow, own: app.ownDevices.has(key) });
   }
 }
 
@@ -648,7 +840,10 @@ const JOB_TIMEOUT_MS = 120_000;
 
 function onBorrowJob(borrowerKey, rec, msg) {
   const l = ledgerOf(borrowerKey);
-  if (l.borrow >= l.give) {
+  // The host's own callers (the bridge) and devices the host marked as
+  // their own borrow freely; the ledger still counts every job.
+  const exempt = borrowerKey === BRIDGE_KEY || app.ownDevices.has(borrowerKey);
+  if (!exempt && l.borrow >= l.give) {
     rec.peer.send({ type: "error", id: msg.id, message: "no credit — you have to give compute before you can borrow. Serve a job first." });
     return;
   }
@@ -661,10 +856,13 @@ function onBorrowJob(borrowerKey, rec, msg) {
     return;
   }
   const eff = effectiveLoad();
+  // A bridge job never lands on the computer's own Ollama through the
+  // fleet: the bridge already passes those through directly.
+  const self = borrowerKey === BRIDGE_KEY && app.hubEngine instanceof OllamaEngine ? null : selfGiver();
   const picked = routePickGiver(app.workers, {
     borrowerKey,
     model: wantModel,
-    self: selfGiver(),
+    self,
     inflight: eff.inflight,
     meanMs: eff.meanMs,
     queued: queuedLoad(),
@@ -686,10 +884,13 @@ function onBorrowJob(borrowerKey, rec, msg) {
     return;
   }
   const giver = picked.giver;
+  // Pin to the giver's own weights id: a job asked for `gemma2:2b` reaches
+  // a phone as the exact WebLLM build it holds (models.js), never looser.
+  const giverModel = giver.key === "self" ? self?.model : modelOf(giver.rec);
   const req = {
     type: "infer",
     id: msg.id,
-    model: wantModel,
+    model: wantModel ? giverModel : null,
     messages: msg.messages || [{ role: "user", content: msg.prompt }],
     stream: true,
     temperature: msg.temperature ?? 0.7,
@@ -697,14 +898,21 @@ function onBorrowJob(borrowerKey, rec, msg) {
   };
   app.route.inflight = routeMarkSent(app.route.inflight, giver.key);
   const t0 = Date.now();
-  const timer = setTimeout(() => {
-    if (!app.relay.has(msg.id)) return;
-    app.relay.delete(msg.id);
-    noteObserved(giver.key, null, false);
-    rec.peer?.send?.({ type: "error", id: msg.id, message: "giver timed out — try again" });
-    renderFleet();
-  }, JOB_TIMEOUT_MS);
-  app.relay.set(msg.id, { giverKey: giver.key, borrowerKey, borrowerRec: rec, t0, model: wantModel, timer });
+  const relayRec = { giverKey: giver.key, borrowerKey, borrowerRec: rec, t0, model: wantModel, timer: null };
+  // Timed on silence, not length: a long answer that keeps streaming is
+  // alive; JOB_TIMEOUT_MS with no token at all is not.
+  relayRec.arm = () => {
+    clearTimeout(relayRec.timer);
+    relayRec.timer = setTimeout(() => {
+      if (app.relay.get(msg.id) !== relayRec) return;
+      app.relay.delete(msg.id);
+      noteObserved(giver.key, null, false);
+      rec.peer?.send?.({ type: "error", id: msg.id, message: "giver timed out — try again" });
+      renderFleet();
+    }, JOB_TIMEOUT_MS);
+  };
+  relayRec.arm();
+  app.relay.set(msg.id, relayRec);
   if (giver.key === "self") {
     serveSelf(req, rec);
   } else {
@@ -732,13 +940,16 @@ async function serveSelf(req, borrowerRec) {
     // The host's own device is a giver under the same pin: a job naming a
     // model it isn't loaded with is refused, never silently answered.
     const loaded = app.hubEngine?.modelId || app.modelId;
-    if (req.model && req.model !== loaded) {
+    if (req.model && !answers(loaded, req.model)) {
       throw new Error(`model_mismatch: host loaded with ${loaded}, job asked for ${req.model}`);
     }
     const { text } = await app.hubEngine.infer(
       req.messages,
       { stream: true, temperature: req.temperature, max_tokens: req.max_tokens },
-      (delta) => borrowerRec.peer?.send({ type: "token", id: req.id, text: delta }),
+      (delta) => {
+        app.relay.get(req.id)?.arm?.();
+        borrowerRec.peer?.send({ type: "token", id: req.id, text: delta });
+      },
     );
     const r = app.relay.get(req.id);
     if (r) clearTimeout(r.timer);
@@ -1252,16 +1463,11 @@ async function acceptDuty() {
     }
 
     statusEl.textContent = "Loading model…";
-    if (app.engine === null) {
-      app.engine = new WorkerEngine((p) => {
-        if (p.progress > 0) progressEl.hidden = false;
-        progressFillEl.style.width = `${Math.round((p.progress || 0) * 100)}%`;
-        modelStatusEl.textContent = p.text || "downloading model";
-      });
-    }
-    await app.engine.load(app.modelId);
-    progressEl.hidden = true;
-    modelStatusEl.textContent = `${app.modelId} — loaded`;
+    // The download started when the page opened (prefetchModel); this
+    // joins it rather than starting over.
+    if (!app.modelReady) app.modelReady = prefetchModel();
+    await app.modelReady;
+    if (!app.engine?.loaded) throw new Error(modelStatusEl.textContent || "the model did not load");
 
     app.leaseUntil = Date.now() + LEASE_TTL;
     app.leaseExpired = false;
@@ -1283,18 +1489,61 @@ async function acceptDuty() {
             t: Date.now(),
             queueDepth: app.engine?.pending ?? 0,
             model: app.engine?.modelId || app.modelId,
+            ctx: app.engine?.contextWindow ?? null,
           });
         }
       }
     }, 15000);
     await keepAwake();
     renderWorkerStatus();
+    updateComposer();
     toast("you are compute now. keep this tab open.");
   } catch (e) {
     reenableAccept();
     statusEl.textContent = `failed: ${e.message}`;
     toast(`accept failed: ${e.message}`);
   }
+}
+
+/** Start downloading and loading the model the moment the link opens, so it
+ *  is ready by the time pairing is done. WebLLM caches the weights on the
+ *  device; a second visit loads from the cache. If the default model will
+ *  not load here (memory, GPU), fall back to the small one — unless the
+ *  person picked the model themselves. */
+async function prefetchModel() {
+  if (!webgpuAvailable()) {
+    modelStatusEl.textContent = "This browser has no WebGPU, so it can't run a model. On iPhone use Safari (iOS 26+); on Android use Chrome.";
+    return;
+  }
+  if (!app.engine) {
+    app.engine = new WorkerEngine((p) => {
+      if (p.progress > 0 && p.progress < 1) progressEl.hidden = false;
+      progressFillEl.style.width = `${Math.round((p.progress || 0) * 100)}%`;
+      modelStatusEl.textContent = p.text || "downloading model";
+    });
+  }
+  const want = app.modelId;
+  try {
+    modelStatusEl.textContent = `getting ${labelOf(want)} ready…`;
+    await app.engine.load(want);
+    progressEl.hidden = true;
+    modelStatusEl.textContent = `${app.engine.modelId} — ready on this device`;
+    renderWorkerStatus();
+  } catch (e) {
+    progressEl.hidden = true;
+    if (!app.modelChosen && want !== FALLBACK_MODEL) {
+      toast(`${labelOf(want)} didn't fit on this device — using a smaller model`);
+      app.modelId = FALLBACK_MODEL;
+      const sel = document.getElementById("model-select");
+      if (sel) sel.value = FALLBACK_MODEL;
+      return prefetchModel();
+    }
+    modelStatusEl.textContent = `model failed to load: ${e?.message || e}`;
+  }
+}
+
+function labelOf(id) {
+  return MODEL_CHOICES.find((m) => m.id === id)?.label.split(" — ")[0] || id;
 }
 
 function reenableAccept() {
@@ -1327,26 +1576,54 @@ async function ensureDeviceKeys() {
 /** Send the signed pairing proof to the host and wait for confirmation. */
 function hostConfirmCode(matrix, codeHash, pubKey, sig) {
   return new Promise((resolve) => {
-    app.pendingVerify = resolve;
-    const timer = setTimeout(() => {
+    let resend = null;
+    let timer = null;
+    // Whoever answers (verified / denied, or the timeout) stops the resends.
+    app.pendingVerify = (v) => {
+      clearInterval(resend);
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const giveUp = () => {
+      clearInterval(resend);
       if (app.pendingVerify) {
         app.pendingVerify = null;
+        app.onAwaitingCode = null;
         resolve(false);
       }
-    }, 25000);
-    matrix
-      .devicesOf(app.creatorId, { retry: 3 })
+    };
+    timer = setTimeout(giveUp, 25000);
+    const sendProof = () =>
+      matrix.devicesOf(app.creatorId, { retry: 3 }).then((devs) => {
+        for (const d of devs) {
+          matrix
+            .sendSignalRetry(d, { type: "verify", deviceId: matrix.deviceId, codeHash, pubKey, sig }, 3)
+            .catch(() => {});
+        }
+        return devs;
+      });
+    // The host answered "not recorded yet": they are there, just haven't
+    // typed the code. Wait for them (the host re-checks when they do).
+    app.onAwaitingCode = () => {
+      clearTimeout(timer);
+      timer = setTimeout(giveUp, 15 * 60_000);
+      // Re-offer the proof now and then: if the host's page reloads while
+      // we wait, it forgets this attempt, and a fresh offer lets the code
+      // they type still find us.
+      if (!resend) resend = setInterval(() => { if (app.pendingVerify) sendProof().catch(() => {}); }, 20_000);
+      statusEl.replaceChildren(
+        el("div", { class: "alert warn" }, [
+          el("div", { text: "Almost there — type this code on your computer:" }),
+          el("div", { class: "kbd big", text: app.pairCode || "" }),
+        ]),
+      );
+    };
+    sendProof()
       .then((devs) => {
         if (!devs.length) {
           clearTimeout(timer);
           app.pendingVerify = null;
           resolve(false);
-          return;
-        }
-        for (const d of devs) {
-          matrix
-            .sendSignalRetry(d, { type: "verify", deviceId: matrix.deviceId, codeHash, pubKey, sig }, 3)
-            .catch(() => {});
         }
       })
       .catch(() => {
@@ -1391,6 +1668,7 @@ function ensureWorkerPeer(remoteDevice) {
         role: "worker",
         deviceId: app.matrix.deviceId,
         model: app.engine?.modelId || app.modelId, // the weights actually loaded, never the picker alone
+        ctx: app.engine?.contextWindow ?? null,
         queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
         ua: navigator.userAgent,
@@ -1413,6 +1691,7 @@ async function onWorkerRtcMessage(peer, msg) {
   }
   if (msg.type === "credit") {
     app.credit = { give: msg.give, borrow: msg.borrow, credit: msg.credit };
+    if (msg.own) app.own = true;
     renderWorkerStatus();
     updateComposer();
     return;
@@ -1447,7 +1726,7 @@ async function onWorkerRtcMessage(peer, msg) {
   // weights. The router should have avoided this; this is the wall behind
   // that wall.
   const loaded = app.engine?.modelId || app.modelId; // the weights, never the picker alone
-  if (msg.model && msg.model !== loaded) {
+  if (msg.model && !answers(loaded, msg.model)) {
     peer.send({ type: "error", id: msg.id, message: `model_mismatch: loaded with ${loaded}, job asked for ${msg.model}` });
     return;
   }
@@ -1472,7 +1751,7 @@ async function onWorkerRtcMessage(peer, msg) {
 function borrowNow() {
   const prompt = borrowEl?.value?.trim();
   if (!prompt) return;
-  if (app.credit.credit <= 0) {
+  if (!app.own && app.credit.credit <= 0) {
     toast("no credit — serve compute to the fleet first, then borrow");
     return;
   }
@@ -1481,7 +1760,8 @@ function borrowNow() {
     toast("not connected to the fleet");
     return;
   }
-  workerConsolePush(`▶ ${prompt}\n`);
+  borrowEl.value = "";
+  workerConsolePush(`${workerConsoleEl?.textContent ? "\n\n" : ""}▶ ${prompt}\n`);
   // model: null = any giver (shortest expected wait). A surface that needs
   // a specific model sets it to that exact WebLLM id and the router pins it.
   peer.send({ type: "job", id: crypto.randomUUID(), prompt, model: null, temperature: 0.7, max_tokens: 1024 });
@@ -1495,9 +1775,11 @@ function workerConsolePush(text) {
 
 function updateComposer() {
   if (!borrowBtnEl) return;
-  const can = app.credit.credit > 0;
+  const can = app.own || app.credit.credit > 0;
   borrowBtnEl.disabled = !can;
-  borrowHintEl.textContent = can
+  borrowHintEl.textContent = app.own
+    ? `${share.name || "the host"} marked this as their own device — ask away (answered by the computer or any other device)`
+    : can
     ? `credit ${app.credit.credit} — you can borrow`
     : "you have not given any compute yet — serve a job first, then you can borrow";
 }
@@ -1546,6 +1828,7 @@ async function keepAwake() {
 
 /* ------------------------------------------------------------------- view */
 
+let qrEl, bridgeCardEl, bridgeStatusEl, ownBoxEl;
 let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, streamsEl, lendBtnEl, lendStatusEl;
 let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, codeEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
@@ -1634,14 +1917,25 @@ function controllerView() {
         return;
       }
       try {
-        await issueCode({ creds: app.session.creds, code, exp: Date.now() + INVITE_TTL });
+        recordBtn.disabled = true;
+        const waited = await recordCode(code, ownBoxEl.checked);
         workerCodeEl.value = "";
-        toast(`recorded ${code} — that worker can accept now`);
+        if (!waited) toast(`recorded ${code} — that device can accept now`);
       } catch (e) {
         toast(`could not record: ${e.message}`);
+      } finally {
+        recordBtn.disabled = false;
       }
     },
   });
+  workerCodeEl.addEventListener("keydown", (e) => { if (e.key === "Enter") recordBtn.click(); });
+  ownBoxEl = el("input", { type: "checkbox" });
+  const ownRow = el("label", { class: "row small" }, [
+    ownBoxEl,
+    el("span", { text: "this is my own device — it can use this computer's inference without earning credit first" }),
+  ]);
+  const pendingEl = el("div", { class: "alert warn", id: "pending-pairs", hidden: true });
+  qrEl = el("div", { class: "qr", hidden: true, title: "scan with your phone's camera" });
   const codeRow = el("div", { class: "linkbox" }, [
     workerCodeEl,
     recordBtn,
@@ -1693,8 +1987,40 @@ function controllerView() {
     el("div", { class: "row" }, [lendBtnEl, lendStatusEl]),
   ]);
 
+  bridgeStatusEl = el("div", { class: "col" });
+  const hostsLine = "ER7_OLLAMA_HOSTS=local=http://localhost:11434,fleet=" + location.origin;
+  bridgeCardEl = el("div", { class: "card", hidden: true }, [
+    el("h2", { text: "This computer" }),
+    el("ol", { class: "steps" }, [
+      el("li", { text: "Scan the QR code below with your phone. It opens heimdall and starts downloading its model." }),
+      el("li", { text: "Tap Accept on the phone. It shows a 6-digit code." }),
+      el("li", { text: "Type that code below. Both machines are then connected." }),
+    ]),
+    bridgeStatusEl,
+    el("p", { class: "muted small", text: `Programs on this computer reach the phones at ${location.origin}, which works like an Ollama server. If no phone has the requested model, the request goes to your real Ollama instead. For eoreader7, set:` }),
+    el("div", { class: "row" }, [el("code", { text: hostsLine }), copyBtn("copy", () => hostsLine)]),
+  ]);
+
+  if (embed) {
+    return el("div", { class: "view embed" }, [
+      bridgeCardEl,
+      el("div", { class: "card" }, [
+        el("div", { class: "row" }, [createBtn, freshBtn]),
+        shareRow,
+        qrEl,
+        pendingEl,
+        codeRow,
+        ownRow,
+        inviteExpiryEl,
+      ]),
+      fleetCardEl,
+      lendCard,
+    ]);
+  }
+
   return el("div", { class: "view" }, [
     header(),
+    bridgeCardEl,
     el("div", { class: "card" }, [
       el("h2", { text: "Fleet" }),
       el("p", { class: "muted", text: "The link names you, carries an expiry, and a secret code the worker must enter to accept. The room is only a directory — prompts and answers travel device-to-device over WebRTC, never through the room. Everyone who borrows must first give." }),
@@ -1702,7 +2028,10 @@ function controllerView() {
       nameEl,
       el("div", { class: "row", style: "" }, [createBtn, freshBtn]),
       shareRow,
+      qrEl,
+      pendingEl,
       codeRow,
+      ownRow,
       cliRow,
       inviteExpiryEl,
     ]),
@@ -1738,6 +2067,8 @@ function renderFleet() {
     if (coordOpen) parts.push(`${coordOpen} coord link${coordOpen > 1 ? "s" : ""} open`);
     sibEl.textContent = parts.join(" · ");
   }
+  bridgeNudge();
+  renderBridge();
   const ul = document.getElementById("fleet");
   if (!ul) return;
   ul.replaceChildren();
@@ -1825,14 +2156,16 @@ function workerView() {
 
   const modelSel = el(
     "select",
-    {},
+    { id: "model-select" },
     MODEL_CHOICES.map((m) =>
       el("option", { value: m.id, selected: m.id === app.modelId ? "" : null, text: m.label }),
     ),
   );
   modelSel.addEventListener("change", () => {
     app.modelId = modelSel.value;
+    app.modelChosen = true;
     localStorage.setItem(MODEL_KEY, app.modelId);
+    app.modelReady = prefetchModel();
   });
 
   const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
@@ -2057,8 +2390,29 @@ function controllerTick() {
 
 /* ------------------------------------------------------------------ boot */
 
-function main() {
+async function main() {
   const root = document.getElementById("app");
+  // One controller per browser. Two tabs (or this page and the Fold's
+  // sheet) sharing one Matrix session would fight over the same device.
+  if (mode === "controller" && navigator.locks) {
+    const got = await new Promise((resolve) => {
+      navigator.locks.request("heimdall-controller", { ifAvailable: true }, (lock) => {
+        resolve(!!lock);
+        return lock ? new Promise(() => {}) : undefined; // hold it for the page's life
+      });
+    });
+    if (!got) {
+      root.append(
+        el("div", { class: "view" + (embed ? " embed" : "") }, [
+          el("div", { class: "card" }, [
+            el("h2", { text: "Heimdall is already running" }),
+            el("p", { class: "muted", text: "Another tab in this browser (or the Fold's Heimdall sheet) is already the controller. Use that one, or close it and reload this." }),
+          ]),
+        ]),
+      );
+      return;
+    }
+  }
   root.append(mode === "controller" ? controllerView() : workerView());
   if (mode === "controller" && app.session?.roomId) {
     rejoin();
@@ -2071,7 +2425,9 @@ function main() {
     }
     renderWorkerStatus();
     updateComposer();
+    app.modelReady = prefetchModel();
   }
+  if (mode === "controller") startBridge();
   if (import.meta.env.PROD && "serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
   }

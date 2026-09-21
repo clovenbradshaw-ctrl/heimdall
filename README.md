@@ -18,6 +18,42 @@ central server.
 - **WebLLM** — each worker runs a local LLM in its own browser tab via WebGPU.
   Models are cached on-device after the first download.
 
+## Your phone and this computer, one fleet
+
+```bash
+npx --yes github:clovenbradshaw-ctrl/heimdall up
+```
+
+(or `npm run up` in a checkout, or the Fold: Heimdall sheet → **Connect your phone**.)
+
+1. The page opens on `http://localhost:8790`, makes the fleet, and shows a QR code.
+2. Scan it with your phone. The phone page starts downloading its model right
+   away (Gemma 2 2B, the same model as the computer's `gemma2:2b`; it falls back
+   to Qwen 2.5 0.5B if the big one won't fit) and shows a 6-digit code. Tap
+   **Accept** once.
+3. Type the phone's code on the computer. It is paired as **your own device**.
+
+Then inference runs both ways:
+
+- **Computer → phone.** `localhost:8790` speaks Ollama's API (`/api/chat`,
+  `/api/generate`, `/api/tags`, `/api/ps`) and OpenAI's (`/v1/chat/completions`).
+  A request for a model a phone holds is answered by the phone; anything else
+  (a model no phone has, a JSON grammar, tools, images, no phone ready, or a
+  phone that fails before its first token) passes through to your real Ollama
+  untouched. For eoreader7:
+  `ER7_OLLAMA_HOSTS="local=http://127.0.0.1:11434,fleet=http://localhost:8790"`.
+- **Phone → computer.** The computer lends its own Ollama (`gemma2:2b` by
+  default; `--lend <model>` or `--lend none`), and the phone's **Borrow
+  compute** box asks the fleet. Your own devices borrow without earning credit
+  first; everyone else still gives before they take.
+
+The names meet in `src/models.js`: `gemma2:2b` ⟷ `gemma-2-2b-it-q4f16_1-MLC`
+(and its f32 build for GPUs without `shader-f16`), and so on. A job is only ever
+answered by the model it named. `/api/ps` lists only what a phone holds right
+now, so a resident-first picker sees the phone as hot only for its real models.
+The bridge listens on 127.0.0.1 and refuses any web origin but its own page.
+Keep that page (or the Fold's sheet) open: it is the controller.
+
 ## Try it
 
 1. Open the deployed site. Enter the name you want workers to see, click **Create fleet room**.
@@ -201,7 +237,7 @@ coordinate as a superorganism, with no leader and no central queue:
   strangers' serves lists only ever attract a forward they must actually
   serve. Credit ledgers stay pairwise (reciprocity needs no center).
 
-Verify it: `node --test src/*.test.mjs` (29 cases: routing, swarm, liveness, revocation),
+Verify it: `node --test src/*.test.mjs` (45 cases: routing, swarm, liveness, revocation, the bridge against a fake Ollama and a fake tab),
 `node scripts/stress-route.mjs` (60 concurrent surfaces × models × two
 heimdalls, migration, per-hop settlement), and
 `node scripts/falsify-route.mjs` (8000 fuzzed picks against the router's

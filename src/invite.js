@@ -99,19 +99,22 @@ export async function ensureControllerSession({ baseUrl, creds }) {
 }
 
 /** Record an issued/onboarded code on the account so any surface can confirm it. */
-export async function issueCode({ creds, code, exp }) {
+export async function issueCode({ creds, code, exp, own = false }) {
   const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
-  active.push({ hash: await sha256Hex(code), exp });
+  // `own`: the host says this is one of their own devices — it borrows from
+  // the fleet without first earning credit (the ledger still counts it).
+  active.push({ hash: await sha256Hex(code), exp, ...(own ? { own: true } : {}) });
   await setAccountData({ ...creds, type: CODE_TYPE, content: { active } });
   return true;
 }
 
-/** Ask the account whether a presented code hash is one it recorded. */
+/** Ask the account whether a presented code hash is one it recorded.
+ *  Returns the recorded entry ({ hash, exp, own? }) or null. */
 export async function confirmCode({ creds, codeHash }) {
   const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
-  return active.some((c) => c.hash === codeHash);
+  return active.find((c) => c.hash === codeHash) ?? null;
 }
 
 /** Drop a used code from the registry so it can't be reused by another device. */
@@ -122,11 +125,17 @@ export async function consumeCode({ creds, codeHash }) {
 }
 
 /** Remember which device public key owns a userId|deviceId after pairing. */
-export async function recordPairedKey({ creds, userId, deviceId, pubKey }) {
+export async function recordPairedKey({ creds, userId, deviceId, pubKey, own = false }) {
   const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
   const paired = (reg?.paired || []).filter((k) => !(k.userId === userId && k.deviceId === deviceId));
-  paired.push({ userId, deviceId, pubKey, at: Date.now() });
+  paired.push({ userId, deviceId, pubKey, at: Date.now(), ...(own ? { own: true } : {}) });
   await setAccountData({ ...creds, type: KEYS_TYPE, content: { paired } }).catch(() => {});
+}
+
+/** The paired devices the host marked as their own: [{ userId, deviceId }]. */
+export async function ownPairedDevices({ creds }) {
+  const reg = await getAccountData({ ...creds, type: KEYS_TYPE }).catch(() => null);
+  return (reg?.paired || []).filter((k) => k.own).map((k) => ({ userId: k.userId, deviceId: k.deviceId }));
 }
 
 /** Forget a device's pairing so a re-join must prove the code again. */

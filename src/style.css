@@ -465,3 +465,42 @@ code {
 .countdown.off {
   color: var(--err);
 }
+/* scan-to-join: the share link as a QR code */
+.qr {
+  width: 220px;
+  max-width: 100%;
+  margin: 10px 0;
+  padding: 8px;
+  background: #fff;
+  border-radius: 10px;
+}
+.qr svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.qr[hidden] {
+  display: none;
+}
+.kbd.big {
+  font-size: 2rem;
+  letter-spacing: 0.25em;
+  display: inline-block;
+  margin-top: 6px;
+}
+.steps {
+  margin: 0 0 10px;
+  padding-left: 1.2em;
+}
+.steps li {
+  margin: 4px 0;
+}
+
+/* ?embed — inside the Fold's Heimdall sheet */
+.view.embed {
+  padding-top: 0;
+}
+.view.embed .card {
+  margin-top: 0;
+  margin-bottom: 12px;
+}

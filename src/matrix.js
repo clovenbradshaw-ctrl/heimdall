@@ -302,8 +302,8 @@ export async function setDisplayName({ baseUrl, accessToken, userId, displayName
   return true;
 }
 
-export function shareUrl(roomId, baseUrl) {
-  const here = `${location.origin}${location.pathname}`;
+export function shareUrl(roomId, baseUrl, site) {
+  const here = site ? site.replace(/\?.*$/, "") : `${location.origin}${location.pathname}`;
   return `${here}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}`;
 }
 

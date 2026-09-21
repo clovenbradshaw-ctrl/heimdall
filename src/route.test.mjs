@@ -150,3 +150,17 @@ test("leader election is deterministic and display-only", () => {
   assert.equal(electLeader(["dev-b", "dev-a", "dev-b"]), "dev-a");
   assert.equal(electLeader([]), null);
 });
+
+test("an Ollama tag pins to the giver holding that model's WebLLM build, and only that", () => {
+  const workers = new Map([
+    ["a", rec("Qwen2.5-0.5B-Instruct-q4f16_1-MLC")],
+    ["b", rec("gemma-2-2b-it-q4f32_1-MLC")],
+  ]);
+  const hit = pickGiver(workers, { model: "gemma2:2b" });
+  assert.equal(hit.giver.key, "b");
+  const miss = pickGiver(workers, { model: "gemma2:9b" });
+  assert.equal(miss.giver, null);
+  assert.equal(miss.reason, "no_giver_for_model");
+  const self = pickGiver(new Map(), { model: "gemma2:2b", self: { key: "self", model: "gemma-2-2b-it-q4f16_1-MLC", loaded: true } });
+  assert.equal(self.giver.key, "self");
+});

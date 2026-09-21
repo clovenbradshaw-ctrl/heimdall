@@ -51,29 +51,55 @@ function png(size, rgba) {
   ]);
 }
 
+// The hive (256-unit design grid, the same geometry as icon.svg): four
+// stacked rounded tiers of a skep and its entrance. Outlines are drawn by
+// signed distance to each tier, supersampled so the PNG edges are smooth.
+const TIERS = [
+  [44, 168, 168, 40, 20],
+  [60, 128, 136, 40, 20],
+  [80, 88, 96, 40, 20],
+  [104, 52, 48, 36, 18],
+];
+const STROKE = 16;
+
+function sdRoundRect(px, py, [x, y, w, h, r]) {
+  const qx = Math.abs(px - (x + w / 2)) - (w / 2 - r);
+  const qy = Math.abs(py - (y + h / 2)) - (h / 2 - r);
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r;
+}
+
+// 1 = hive ink, 0 = background, null = not decided here.
+function doorAt(u, v) {
+  // the entrance: an arch opening cut into the bottom tier, outlined
+  const inside = (u >= 110 && u <= 146 && v >= 190 && v <= 212) || (Math.hypot(u - 128, v - 190) <= 18 && v <= 190);
+  const outer = (u >= 102 && u <= 154 && v >= 190 && v <= 212) || (Math.hypot(u - 128, v - 190) <= 26 && v <= 190);
+  if (inside) return 0;
+  if (outer) return 1;
+  return null;
+}
+
+function inHive(u, v) {
+  const door = doorAt(u, v);
+  if (door != null) return door === 1;
+  return TIERS.some((t) => Math.abs(sdRoundRect(u, v, t)) <= STROKE / 2);
+}
+
 function render(size) {
   const px = Buffer.alloc(size * size * 4);
-  const c = size / 2;
-  const bg = [0x0b, 0x0e, 0x14, 0xff];
-  const fg = [0x63, 0xd9, 0xa8, 0xff];
-  const rOut = size * 0.38;
-  const rIn = size * 0.30;
-  const barHalf = size * 0.045;
-  const pupil = size * 0.07;
+  const bg = [0x0b, 0x0e, 0x14];
+  const fg = [0xf2, 0xb5, 0x44];
+  const k = 256 / size;
+  const SS = 4;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const dx = x - c;
-      const dy = y - c;
-      const d = Math.sqrt(dx * dx + dy * dy);
+      let hit = 0;
+      for (let sy = 0; sy < SS; sy++)
+        for (let sx = 0; sx < SS; sx++)
+          if (inHive((x + (sx + 0.5) / SS) * k, (y + (sy + 0.5) / SS) * k)) hit++;
+      const a = hit / (SS * SS);
       const i = (y * size + x) * 4;
-      let col = bg;
-      if (Math.abs(x - c) <= barHalf) col = fg; // central gate bar
-      else if (d <= rOut && d >= rIn) col = fg; // ring
-      else if (d <= pupil) col = fg; // pupil
-      px[i] = col[0];
-      px[i + 1] = col[1];
-      px[i + 2] = col[2];
-      px[i + 3] = col[3];
+      for (let ch = 0; ch < 3; ch++) px[i + ch] = Math.round(bg[ch] * (1 - a) + fg[ch] * a);
+      px[i + 3] = 0xff;
     }
   }
   return px;

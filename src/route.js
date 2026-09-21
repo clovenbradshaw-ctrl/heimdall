@@ -14,7 +14,7 @@
 //   1. ELIGIBLE — status ready, link open, lease live. Nothing else is
 //      routable, never silently.
 //   2. PINNED — a job naming a model only goes to a giver LOADED with
-//      that exact model id. No match → { giver: null, reason:
+//      that exact model id (or the Ollama tag it maps to, models.js). No match → { giver: null, reason:
 //      "no_giver_for_model" }, never a quiet wrong-model answer.
 //      (Mirrors the-fold's isPinnedModel: a picked mouth outranks the
 //      ladder. Here the pin is the model id itself.)
@@ -30,6 +30,7 @@
 // the mean, so a flaky giver sheds load without poisoning its score.
 
 import { STALE_AFTER_MS } from "./liveness.js";
+import { answers } from "./models.js";
 
 export const EWMA_ALPHA = 0.4;
 
@@ -90,12 +91,12 @@ export function pickGiver(workers, {
   for (const [key, rec] of entries) {
     if (key === borrowerKey) continue;
     if (!isEligible(rec, now)) continue;
-    if (model && modelOf(rec) !== model) continue;
+    if (model && !answers(modelOf(rec), model)) continue;
     cands.push(key);
   }
   // The host lending its own device is a giver too — same eligibility
   // bar (loaded), same model pin, never itself when it borrows.
-  if (self?.loaded && self.key !== borrowerKey && (!model || self.model === model)) {
+  if (self?.loaded && self.key !== borrowerKey && (!model || answers(self.model, model))) {
     cands.push(self.key);
   }
   if (!cands.length) {
