@@ -99,12 +99,15 @@ export async function ensureControllerSession({ baseUrl, creds }) {
 }
 
 /** Record an issued/onboarded code on the account so any surface can confirm it. */
-export async function issueCode({ creds, code, exp, own = false }) {
+export async function issueCode({ creds, code, exp, own = false, link = false }) {
   const reg = await getAccountData({ ...creds, type: CODE_TYPE }).catch(() => null);
   const active = (reg?.active || []).filter((c) => c.exp > Date.now());
   // `own`: the host says this is one of their own devices — it borrows from
   // the fleet without first earning credit (the ledger still counts it).
-  active.push({ hash: await sha256Hex(code), exp, ...(own ? { own: true } : {}) });
+  // `link`: a secret carried by the share link (its QR code) rather than
+  // read aloud — possessing the link IS the pairing, so it is not bound to
+  // one device's key fingerprint and is not consumed by the first use.
+  active.push({ hash: await sha256Hex(code), exp, ...(own ? { own: true } : {}), ...(link ? { link: true } : {}) });
   await setAccountData({ ...creds, type: CODE_TYPE, content: { active } });
   return true;
 }

@@ -319,6 +319,7 @@ export function parseShareUrl() {
     name: params.get("name") || "",
     exp: Number(params.get("exp")) || 0,
     codeHash: params.get("c") || "",
+    key: params.get("k") || "", // the link's own pairing secret (the QR code carries it)
   };
 }
 

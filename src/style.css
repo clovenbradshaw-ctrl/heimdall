@@ -504,3 +504,19 @@ code {
   margin-top: 0;
   margin-bottom: 12px;
 }
+
+/* dead-simple layouts: the QR page and the phone page */
+.view.simple .card.center { text-align: center; }
+.view.simple .card.center .qr { margin: 10px auto; width: 260px; }
+.view.simple details.more > summary { cursor: pointer; }
+.view.simple details.more[open] > * + * { margin-top: 10px; }
+.bridge-line, .activity .row { display: flex; align-items: center; justify-content: center; gap: 8px; }
+.activity .row { justify-content: flex-start; font-weight: 600; }
+.act-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.bridge-line.running .act-dot, .activity.on .act-dot { background: var(--accent); animation: act-pulse 1s ease-in-out infinite; }
+.activity.on .act-label { color: var(--accent); }
+.act-ask:not(:empty) { margin-top: 6px; font-style: italic; }
+.act-text { margin-top: 6px; font-family: var(--mono, ui-monospace, monospace); font-size: 13px; white-space: pre-wrap; max-height: 9em; overflow: hidden; }
+.activity:not(.on) .act-text { opacity: 0.5; }
+.badge.running { background: var(--accent-dim); color: #fff; animation: act-pulse 1s ease-in-out infinite; }
+@keyframes act-pulse { 50% { opacity: 0.45; } }

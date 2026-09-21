@@ -59,6 +59,9 @@ const mode = share ? "worker" : "controller";
 // ?embed: the controller shown inside another page (the Fold's Heimdall
 // sheet) — just the pairing and the devices, none of the page chrome.
 const embed = new URLSearchParams(location.search).has("embed");
+// A QR link carries its own pairing secret, so the phone page can be one
+// button: nothing to read out, nothing to type.
+const simple = mode === "worker" && !!share?.key;
 
 const app = {
   mode,
@@ -299,12 +302,16 @@ async function verifyPairing(senderUserId, content) {
       const fingerprint = await codeFromPublicKey(content.pubKey);
       const fpMatches = (await sha256Hex(fingerprint)) === content.codeHash;
       const payload = pairingPayload(app.roomId, senderUserId, content.deviceId, content.codeHash);
-      sigHolds = fpMatches && (await verifyText(pubKey, payload, content.sig));
-      if (sigHolds) recorded = await confirmCode({ creds, codeHash: content.codeHash });
-      ok = sigHolds && !!recorded;
+      const sigValid = await verifyText(pubKey, payload, content.sig);
+      sigHolds = fpMatches && sigValid;
+      if (sigValid) recorded = await confirmCode({ creds, codeHash: content.codeHash });
+      // A read-aloud code must be this device's key fingerprint; a link
+      // secret (from the QR code) needs only the signature binding it to
+      // this device's key.
+      ok = sigValid && !!recorded && (fpMatches || !!recorded.link);
       if (ok) {
         const own = !!recorded.own;
-        consumeCode({ creds, codeHash: content.codeHash }).catch(() => {});
+        if (!recorded.link) consumeCode({ creds, codeHash: content.codeHash }).catch(() => {});
         recordPairedKey({ creds, userId: senderUserId, deviceId: content.deviceId, pubKey: content.pubKey, own }).catch(() => {});
         if (own) app.ownDevices.add(deviceKey({ userId: senderUserId, deviceId: content.deviceId }));
       }
@@ -350,18 +357,32 @@ function renderPendingPairs() {
   box.textContent = n ? `${n} device${n > 1 ? "s" : ""} waiting — type the 6-digit code shown on ${n > 1 ? "each" : "it"}` : "";
 }
 
+/** The link's pairing secret: minted once per room and invite, recorded on
+ *  the account as an own-device code, and carried in the link. Scanning the
+ *  QR code is the whole pairing — no code to read out. The link is therefore
+ *  a credential: anyone holding it joins as your own device until it expires
+ *  (remove/ban still apply). */
+async function linkSecret(exp) {
+  if (app.session?.linkKey?.room === app.roomId && app.session.linkKey.exp > Date.now()) return app.session.linkKey.key;
+  const key = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  await issueCode({ creds: app.session.creds, code: key, exp, own: true, link: true });
+  saveSession({ linkKey: { room: app.roomId, key, exp } });
+  return key;
+}
+
 async function buildInviteUrl() {
   const name = app.displayName || app.matrix.userId;
   const exp = Date.now() + INVITE_TTL;
   app.invite = { name, exp };
   saveSession({ invite: app.invite });
+  const k = await linkSecret(exp);
   // Served by the local bridge, the page lives on localhost — a phone
   // can't open that. Hand out the public site instead (same code).
   const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
   const base = shareUrl(app.roomId, app.hs, local ? app.bridgeInfo?.site || PUBLIC_SITE : undefined);
   // The 6-digit pairing code is generated on the WORKER's device and given to
   // you out of band; you record it to onboard them. It never rides in the link.
-  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}`;
+  return `${base}&host=${encodeURIComponent(app.matrix.userId)}&name=${encodeURIComponent(name)}&exp=${exp}&k=${k}`;
 }
 
 async function renewInvite() {
@@ -423,7 +444,7 @@ async function rejoin() {
    (eoreader7, anything that speaks Ollama) reach the fleet through it. */
 
 async function startBridge() {
-  const info = await detectBridge();
+  const info = app.bridgeInfo || (await detectBridge());
   if (!info) return;
   app.bridgeInfo = info;
   app.bridgeJobs = 0;
@@ -512,16 +533,21 @@ async function lendOllama(tag) {
 function renderBridge() {
   if (!bridgeStatusEl || !app.bridgeInfo) return;
   const now = Date.now();
-  const ready = [...app.workers.values()].filter((r) => isEligible(r, now));
-  const tags = [...new Set(ready.map((r) => ollamaTagOf(modelOf(r)) || modelOf(r)).filter(Boolean))];
-  const lent = app.hubEngine instanceof OllamaEngine ? app.hubEngine.modelId : null;
+  const ready = [...app.workers.entries()].filter(([, r]) => isEligible(r, now));
+  const busy = ready.filter(([k, r]) => (app.route.inflight[k] ?? 0) > 0 || (r.queueDepth ?? 0) > 0);
+  const nameOf = (r) => r.hello?.name || "phone";
+  const line = app.bridgeStatus && app.bridgeStatus !== "connected"
+    ? "reconnecting to this computer…"
+    : busy.length
+      ? `Running on ${busy.map(([, r]) => nameOf(r)).join(", ")} now`
+      : ready.length
+        ? `${ready.map(([, r]) => `${nameOf(r)} ready (${labelOf(modelOf(r))})`).join(", ")}`
+        : app.workers.size
+          ? "Phone connecting…"
+          : "Waiting for a phone";
   bridgeStatusEl.replaceChildren(
-    el("div", { class: "row" }, [
-      el("span", { class: `badge ${app.bridgeStatus === "connected" ? "ok" : "warn"}`, text: `bridge ${app.bridgeStatus || "starting"}` }),
-      el("span", { class: `badge ${ready.length ? "ok" : ""}`, text: ready.length ? `${ready.length} device${ready.length > 1 ? "s" : ""} ready: ${tags.join(", ")}` : "no devices ready yet" }),
-      lent ? el("span", { class: "badge ok", text: `phones can borrow ${lent}` }) : null,
-      app.bridgeJobs ? el("span", { class: "badge", text: `${app.bridgeJobs} job${app.bridgeJobs > 1 ? "s" : ""} from this computer` }) : null,
-    ].filter(Boolean)),
+    el("div", { class: "bridge-line" + (busy.length ? " running" : "") }, [el("span", { class: "act-dot" }), el("span", { text: line })]),
+    app.bridgeJobs ? el("div", { class: "muted small", text: `${app.bridgeJobs} request${app.bridgeJobs > 1 ? "s" : ""} from this computer so far` }) : null,
   );
 }
 
@@ -918,6 +944,7 @@ function onBorrowJob(borrowerKey, rec, msg) {
   } else {
     giver.rec.peer.send(req);
   }
+  renderFleet();
 }
 
 function pickGiver(borrowerKey, model = null) {
@@ -1423,7 +1450,7 @@ async function acceptDuty() {
   const verifiedFlag = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
   if (!verifiedFlag) {
     await ensureDeviceKeys();
-    if (!/^\d{6}$/.test(app.pairCode || "")) {
+    if (!share.key && !/^\d{6}$/.test(app.pairCode || "")) {
       toast("waiting for your device code…");
       return;
     }
@@ -1448,14 +1475,14 @@ async function acceptDuty() {
 
     if (!verifiedFlag) {
       // Prove the pairing: fingerprint code + signed payload to the host.
-      const codeHash = await sha256Hex(app.pairCode);
+      const codeHash = await sha256Hex(share.key || app.pairCode);
       const payload = pairingPayload(app.roomId, matrix.userId, matrix.deviceId, codeHash);
       const sig = await signText(app.pairPriv, payload);
       const confirmed = await hostConfirmCode(matrix, codeHash, app.pairPub, sig);
       if (!confirmed) {
         reenableAccept();
-        statusEl.textContent = "blocked: the host didn't confirm your code";
-        toast("the host didn't confirm your code — they may be offline, or the code is wrong");
+        statusEl.textContent = share.key ? "blocked: the host didn't confirm this link — it may have expired, or their page is closed" : "blocked: the host didn't confirm your code";
+        toast(share.key ? "the host didn't confirm this link — is their heimdall page open?" : "the host didn't confirm your code — they may be offline, or the code is wrong");
         return;
       }
       // Confirmed once by the host on this device → lease renewals don't re-ask.
@@ -1527,7 +1554,7 @@ async function prefetchModel() {
     modelStatusEl.textContent = `getting ${labelOf(want)} ready…`;
     await app.engine.load(want);
     progressEl.hidden = true;
-    modelStatusEl.textContent = `${app.engine.modelId} — ready on this device`;
+    modelStatusEl.textContent = `${labelOf(app.engine.modelId)} ready`;
     renderWorkerStatus();
   } catch (e) {
     progressEl.hidden = true;
@@ -1731,6 +1758,7 @@ async function onWorkerRtcMessage(peer, msg) {
     return;
   }
   const t0 = Date.now();
+  activityStart(msg);
   try {
     const { text } = await app.engine.infer(
       msg.messages || [{ role: "user", content: msg.prompt }],
@@ -1739,13 +1767,57 @@ async function onWorkerRtcMessage(peer, msg) {
         temperature: msg.temperature ?? 0.7,
         max_tokens: msg.max_tokens ?? 1024,
       },
-      (delta) => peer.send({ type: "token", id: msg.id, text: delta }),
+      (delta) => {
+        activityToken(delta);
+        peer.send({ type: "token", id: msg.id, text: delta });
+      },
     );
     peer.send({ type: "result", id: msg.id, text, duration_ms: Date.now() - t0 });
+    activityEnd(true, Date.now() - t0);
     renderWorkerStatus();
   } catch (e) {
+    activityEnd(false);
     peer.send({ type: "error", id: msg.id, message: String(e?.message || e) });
   }
+}
+
+/* ---- what this phone is doing right now: shown, so running inference on
+   the phone is something you can see happen, not take on faith. ---- */
+const activity = { running: 0, served: 0, lastMs: null };
+let activityEl, activityTextEl;
+
+function activityStart(msg) {
+  activity.running++;
+  const ask = (msg.messages || []).filter((m) => m.role === "user").at(-1)?.content || msg.prompt || "";
+  if (activityTextEl) {
+    activityTextEl.textContent = "";
+    activityTextEl.dataset.ask = String(ask).slice(0, 140);
+  }
+  renderActivity();
+}
+function activityToken(delta) {
+  if (!activityTextEl) return;
+  activityTextEl.textContent = (activityTextEl.textContent + delta).slice(-600);
+}
+function activityEnd(ok, ms) {
+  activity.running = Math.max(0, activity.running - 1);
+  if (ok) {
+    activity.served++;
+    activity.lastMs = ms;
+  }
+  renderActivity();
+}
+function renderActivity() {
+  if (!activityEl) return;
+  const on = activity.running > 0;
+  activityEl.classList.toggle("on", on);
+  activityEl.querySelector(".act-label").textContent = on
+    ? "Running inference on this phone"
+    : activity.served
+      ? `Idle · ${activity.served} answered${activity.lastMs ? ` · last ${(activity.lastMs / 1000).toFixed(1)}s` : ""}`
+      : app.leaseUntil ? "Ready — waiting for work" : "Not lending yet";
+  const ask = activityTextEl?.dataset.ask;
+  activityEl.querySelector(".act-ask").textContent = on && ask ? ask : "";
 }
 
 function borrowNow() {
@@ -1777,7 +1849,9 @@ function updateComposer() {
   if (!borrowBtnEl) return;
   const can = app.own || app.credit.credit > 0;
   borrowBtnEl.disabled = !can;
-  borrowHintEl.textContent = app.own
+  borrowHintEl.textContent = simple
+    ? (can ? "" : "available once lending starts")
+    : app.own
     ? `${share.name || "the host"} marked this as their own device — ask away (answered by the computer or any other device)`
     : can
     ? `credit ${app.credit.credit} — you can borrow`
@@ -2001,6 +2075,31 @@ function controllerView() {
     el("div", { class: "row" }, [el("code", { text: hostsLine }), copyBtn("copy", () => hostsLine)]),
   ]);
 
+  // Served by `heimdall up` (or embedded in the Fold): one thing to do —
+  // scan. Everything else folds under "more".
+  if (app.bridgeInfo) {
+    return el("div", { class: "view simple" + (embed ? " embed" : "") }, [
+      el("div", { class: "card center" }, [
+        el("h2", { text: "Scan with your phone" }),
+        qrEl,
+        bridgeStatusEl,
+      ]),
+      fleetCardEl,
+      el("details", { class: "card more" }, [
+        el("summary", { class: "muted", text: "more" }),
+        el("div", { class: "row" }, [createBtn, freshBtn]),
+        shareRow,
+        inviteExpiryEl,
+        pendingEl,
+        codeRow,
+        ownRow,
+        el("p", { class: "muted small", text: "Programs on this computer reach the phone at " + location.origin + " (it speaks Ollama). For eoreader7:" }),
+        el("div", { class: "row" }, [el("code", { text: hostsLine }), copyBtn("copy", () => hostsLine)]),
+        lendCard,
+      ]),
+    ]);
+  }
+
   if (embed) {
     return el("div", { class: "view embed" }, [
       bridgeCardEl,
@@ -2102,7 +2201,9 @@ function renderFleet() {
           el("div", { class: "meta", text: lastSeenText(rec.lastSeen) + (rec.renewed ? " · renewed" : "") }),
         ]),
         lease,
-        el("span", { class: "badge", text: standing }),
+        (app.route.inflight[key] ?? 0) > 0 || (rec.queueDepth ?? 0) > 0
+          ? el("span", { class: "badge running", text: "running now" })
+          : el("span", { class: "badge", text: standing }),
         el("button", { class: "ghost small", text: "renew", onclick: () => nudgeRenew(key) }),
         el("button", { class: "ghost small", title: "kick from the room and revoke this device", text: "remove", onclick: () => removeWorker(key) }),
         el("button", { class: "ghost small", title: "ban from the room and revoke every device of this account", text: "ban", onclick: () => removeWorker(key, { ban: true }) }),
@@ -2136,6 +2237,57 @@ function lastSeenText(ts) {
   if (!ts) return "…";
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
   return s < 60 ? `${s}s ago` : `${Math.round(s / 60)}m ago`;
+}
+
+function simpleWorkerView() {
+  const who = share.name || share.host || "your computer";
+  acceptBtnEl = el("button", { class: "primary big", text: "Start", onclick: acceptDuty });
+  progressEl = el("div", { class: "progress", hidden: true });
+  progressFillEl = el("div");
+  progressEl.append(progressFillEl);
+  modelStatusEl = el("div", { class: "muted small" });
+  statusEl = el("div", { class: "muted small" });
+
+  const modelSel = el(
+    "select",
+    { id: "model-select" },
+    MODEL_CHOICES.map((m) => el("option", { value: m.id, selected: m.id === app.modelId ? "" : null, text: m.label })),
+  );
+  modelSel.addEventListener("change", () => {
+    app.modelId = modelSel.value;
+    app.modelChosen = true;
+    localStorage.setItem(MODEL_KEY, app.modelId);
+    app.modelReady = prefetchModel();
+  });
+
+  activityTextEl = el("div", { class: "act-text" });
+  activityEl = el("div", { class: "activity" }, [
+    el("div", { class: "row" }, [el("span", { class: "act-dot" }), el("span", { class: "act-label" })]),
+    el("div", { class: "act-ask muted small" }),
+    activityTextEl,
+  ]);
+
+  borrowEl = el("textarea", { placeholder: `Ask ${who}…` });
+  borrowBtnEl = el("button", { class: "primary", text: "Ask", disabled: "", onclick: borrowNow });
+  borrowHintEl = el("div", { class: "muted small" });
+  workerConsoleEl = el("div", { class: "console", text: "" });
+
+  const view = el("div", { class: "view simple" }, [
+    el("div", { class: "card" }, [
+      el("h2", { text: `Lend this phone to ${who}` }),
+      webgpuAvailable() ? null : el("div", { class: "alert warn", text: "This browser can't run models (no WebGPU). Use Safari on iOS 26+ or Chrome on Android." }),
+      modelStatusEl,
+      progressEl,
+      el("div", { style: "height:8px" }),
+      acceptBtnEl,
+      statusEl,
+      el("details", { class: "small" }, [el("summary", { class: "muted", text: "model" }), modelSel]),
+    ].filter(Boolean)),
+    el("div", { class: "card", id: "worker-status" }, [activityEl]),
+    el("div", { class: "card" }, [borrowEl, el("div", { class: "row" }, [borrowBtnEl, borrowHintEl]), workerConsoleEl]),
+  ]);
+  renderActivity();
+  return view;
 }
 
 function workerView() {
@@ -2303,6 +2455,26 @@ function renderIdentity() {
 }
 
 function renderWorkerStatus() {
+  if (simple) {
+    if (!statusEl) return;
+    const online = [...app.peers.values()].some((p) => p.opened);
+    statusEl.textContent = app.removed
+      ? `Removed by ${share.name || "the host"}.`
+      : app.leaseExpired
+        ? "Paused — tap Start to lend again."
+        : app.leaseUntil
+          ? `${online ? "Connected" : "Connecting…"} · lending for ${countdownText(app.leaseUntil).replace(/^in /, "")}`
+          : "";
+    if (acceptBtnEl && app.leaseUntil && !app.leaseExpired && !app.removed) {
+      acceptBtnEl.textContent = "Lending";
+      acceptBtnEl.disabled = true;
+    } else if (acceptBtnEl && (app.leaseExpired || app.renewRequested)) {
+      acceptBtnEl.textContent = "Start";
+      acceptBtnEl.disabled = false;
+    }
+    renderActivity();
+    return;
+  }
   const box = document.getElementById("worker-status");
   if (!box || !statusEl) return;
   const online = [...app.peers.values()].filter((p) => p.opened).length;
@@ -2413,7 +2585,8 @@ async function main() {
       return;
     }
   }
-  root.append(mode === "controller" ? controllerView() : workerView());
+  if (mode === "controller") app.bridgeInfo = await detectBridge();
+  root.append(mode === "controller" ? controllerView() : simple ? simpleWorkerView() : workerView());
   if (mode === "controller" && app.session?.roomId) {
     rejoin();
   }
