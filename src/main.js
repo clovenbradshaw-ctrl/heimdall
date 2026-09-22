@@ -177,7 +177,10 @@ async function ensureMatrix() {
 
 async function tryLogin({ baseUrl, username, password }) {
   const creds = await login({ baseUrl, username, password });
-  saveSession({ creds });
+  // A fleet belongs to the account that made it: on the computer, signing in
+  // as someone new starts that account's own fleet (press Start again).
+  if (mode === "controller") saveSession({ creds, roomId: null, linkKey: null, invite: null });
+  else saveSession({ creds });
   location.reload();
 }
 
@@ -636,10 +639,14 @@ async function reconcile() {
   const ally = amAlly({ creatorId: app.matrix.roomCreator(), userId: app.matrix.userId });
   app.ally = ally;
   if (!ally) {
-    const members = app.matrix.roomMembers();
+    // Your own account's other devices count too: a phone signed into the
+    // same account as this computer is the plainest pairing there is.
+    const members = [...app.matrix.roomMembers(), app.matrix.userId];
     for (const userId of members) {
       const devs = await app.matrix.devicesOf(userId, { retry: 0 });
       for (const device of devs) {
+        if (userId === app.matrix.userId && String(device.deviceId) === String(app.matrix.deviceId)) continue; // this page
+        if (app.controllers.has(deviceKey(device))) continue; // another heimdall, not a horse
         const key = deviceKey(device);
         if (isRevoked(app.revoked, device)) continue; // removed stays removed
         if (app.workers.has(key)) continue;
@@ -2392,6 +2399,11 @@ function simpleWorkerView() {
       statusEl,
     ].filter(Boolean)),
     el("div", { class: "card", id: "worker-status" }, [activityEl]),
+    el("details", { class: "card more" }, [
+      el("summary", { class: "muted", text: app.session?.creds?.userId ? `signed in as ${app.session.creds.userId}` : "sign in (optional)" }),
+      el("p", { class: "muted small", text: "Sign in with the same account as your computer to keep one account for all your devices." }),
+      loginCard(),
+    ]),
   ]);
   renderActivity();
   return view;
