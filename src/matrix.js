@@ -8,6 +8,8 @@ import {
 
 export const SIGNAL_TYPE = "org.heimdall.signal";
 
+const ENCRYPTION_STATE = { type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } };
+
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -79,9 +81,26 @@ export class MatrixPeer {
       name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
       preset: "public_chat",
       visibility: "private",
+      initial_state: [ENCRYPTION_STATE],
     });
     this.roomId = res.room_id;
     return this.roomId;
+  }
+
+  /** The room carries no messages, but it must be ENCRYPTED: the crypto only
+   *  tracks the device lists of people it shares an encrypted room with. In a
+   *  plain room a worker whose keys were fetched a moment before it uploaded
+   *  them stays "unknown device" forever, and every to-device signal to it is
+   *  dropped. Idempotent; only someone allowed to set state can do it. */
+  async ensureEncrypted() {
+    const room = this.client.getRoom(this.roomId);
+    if (room?.currentState?.getStateEvents("m.room.encryption", "")) return true;
+    try {
+      await this.client.sendStateEvent(this.roomId, "m.room.encryption", ENCRYPTION_STATE.content, "");
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async joinRoom(roomId) {

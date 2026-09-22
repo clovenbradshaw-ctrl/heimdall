@@ -428,6 +428,7 @@ async function rejoin() {
     const matrix = await ensureMatrix();
     await matrix.joinRoom(app.session.roomId);
     app.roomId = app.session.roomId;
+    await matrix.ensureEncrypted();
     fleetCardEl.hidden = false;
     promptCardEl.hidden = false;
     refreshShareBox();
