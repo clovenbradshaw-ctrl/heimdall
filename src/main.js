@@ -1596,7 +1596,8 @@ async function acceptDuty() {
     await app.modelReady;
     if (!app.engine?.loaded) throw new Error(modelStatusEl.textContent || "the model did not load");
 
-    app.leaseUntil = Date.now() + LEASE_TTL;
+    app.leaseUntil = app.resumeLease && app.resumeLease > Date.now() ? app.resumeLease : Date.now() + LEASE_TTL;
+    app.resumeLease = null;
     app.leaseExpired = false;
     app.renewRequested = false;
     localStorage.setItem(`heimdall.lease.${app.roomId}`, String(app.leaseUntil));
@@ -2863,6 +2864,14 @@ async function main() {
     renderWorkerStatus();
     updateComposer();
     app.modelReady = prefetchModel();
+    // A reload inside a live lease (the host asked for one, the tab was
+    // discarded, the phone rebooted) picks up where it left off — the lease
+    // was already consented to, and it is kept, never extended.
+    const paired = localStorage.getItem(`heimdall.verified.${app.roomId}`) === "1";
+    if (paired && saved > Date.now()) {
+      app.resumeLease = saved;
+      acceptDuty();
+    }
   }
   if (mode === "controller") startBridge();
   if (import.meta.env.PROD && "serviceWorker" in navigator) {
