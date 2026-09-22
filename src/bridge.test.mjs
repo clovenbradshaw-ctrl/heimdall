@@ -224,3 +224,11 @@ test("with no fresh tab state, nothing is promised", async () => {
   await ndjson(await post("/api/chat", { model: "gemma2:2b", messages: [{ role: "user", content: "hi" }] }));
   assert.equal(upstreamHits.length, hits + 1);
 });
+
+test("model `any` goes to whatever a ready phone holds", async () => {
+  tabMode = "stream";
+  await post("/bridge/state", { at: Date.now(), workers: [{ key: "p", name: "Android", model: "Qwen2.5-0.5B-Instruct-onnx-q4", ready: true }] });
+  const lines = await ndjson(await post("/api/chat", { model: "any", messages: [{ role: "user", content: "hi" }] }));
+  assert.equal(lines.at(-1).heimdall, "fleet");
+  assert.equal(lines.slice(0, -1).map((l) => l.message.content).join(""), "Hello phone");
+});

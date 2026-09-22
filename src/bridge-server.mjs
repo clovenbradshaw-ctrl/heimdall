@@ -73,7 +73,10 @@ export function createBridge({
 
   const tabAlive = () => tabs.size > 0 && Date.now() - stateAt < TAB_FRESH_MS;
   const readyWorkers = () => (tabAlive() ? (state?.workers ?? []).filter((w) => w.ready && w.model) : []);
-  const fleetServes = (model) => !!model && readyWorkers().some((w) => answers(w.model, model));
+  // `any` (or `fleet`) asks for whatever a ready phone holds — the caller
+  // chose not to pin a model. Every other name is pinned exactly.
+  const isAny = (model) => model === "any" || model === "fleet";
+  const fleetServes = (model) => !!model && readyWorkers().some((w) => isAny(model) || answers(w.model, model));
 
   function toTab(msg) {
     const tab = [...tabs].at(-1);
@@ -123,7 +126,7 @@ export function createBridge({
         },
       });
       arm(FIRST_TOKEN_MS);
-      if (!toTab({ type: "job", id, model, messages, temperature, max_tokens })) finish(null, "no controller tab");
+      if (!toTab({ type: "job", id, model: isAny(model) ? null : model, messages, temperature, max_tokens })) finish(null, "no controller tab");
     });
   }
 
