@@ -175,11 +175,25 @@ async function ensureMatrix() {
   return matrix;
 }
 
+/** A full id (@you:server) names its own server: ask that server where its
+ *  client API lives (.well-known), falling back to https://server. */
+async function homeserverFor(username, fallback) {
+  const m = /^@[^:]+:(.+)$/.exec(username.trim());
+  if (!m) return fallback;
+  const server = m[1];
+  try {
+    const r = await fetch(`https://${server}/.well-known/matrix/client`);
+    const base = (await r.json())?.["m.homeserver"]?.base_url;
+    if (base) return base.replace(/\/+$/, "");
+  } catch {}
+  return `https://${server}`;
+}
+
 async function tryLogin({ baseUrl, username, password }) {
   const creds = await login({ baseUrl, username, password });
   // A fleet belongs to the account that made it: on the computer, signing in
   // as someone new starts that account's own fleet (press Start again).
-  if (mode === "controller") saveSession({ creds, roomId: null, linkKey: null, invite: null });
+  if (mode === "controller") saveSession({ creds, roomId: null, linkKey: null, invite: null, autostart: true });
   else saveSession({ creds });
   location.reload();
 }
@@ -485,7 +499,12 @@ async function startBridge() {
   renderBridge();
   if (app.roomId) refreshShareBox();
   // No fleet yet: the Start button on the page makes one (it creates a
-  // Matrix account, so it waits for a person's click).
+  // Matrix account, so it waits for a person's click) — or the person just
+  // signed in, which is that click.
+  if (!app.session?.roomId && app.session?.autostart) {
+    saveSession({ autostart: false });
+    await createRoom();
+  }
   // Lend this computer's Ollama back, so a phone can borrow its GPU.
   if (info.lendModel && !app.lendDevice) await lendOllama(info.lendModel);
 }
@@ -1753,6 +1772,23 @@ function openWorkerRelay(remoteDevice) {
   return peer;
 }
 
+/** What the browser will actually hand a page: one adapter request per
+ *  option set (WebLLM asks for high-performance), measured once. */
+let gpuProbeResult = null;
+async function gpuProbe() {
+  if (gpuProbeResult) return gpuProbeResult;
+  const out = { ua: navigator.userAgent.slice(0, 160) };
+  for (const [name, opts] of [["default", {}], ["high", { powerPreference: "high-performance" }], ["low", { powerPreference: "low-power" }], ["fallback", { forceFallbackAdapter: true }]]) {
+    try {
+      const a = await navigator.gpu?.requestAdapter?.(opts);
+      out[name] = a ? { ok: true, f16: a.features?.has?.("shader-f16"), vendor: a.info?.vendor || "", arch: a.info?.architecture || "", maxBuf: a.limits?.maxBufferSize } : { ok: false };
+    } catch (e) {
+      out[name] = { error: String(e?.message || e).slice(0, 80) };
+    }
+  }
+  return (gpuProbeResult = out);
+}
+
 function startWorkerDiag() {
   if (app.diagTimer) return;
   app.diagTimer = setInterval(async () => {
@@ -1768,6 +1804,7 @@ function startWorkerDiag() {
       recv: (app.matrix.recvLog || []).slice(-12).map((r) => `${r.kind || r.type}${r.failed ? "!FAIL" : ""}@${Math.round((Date.now() - r.at) / 1000)}s`),
       pendingVerify: !!app.pendingVerify,
       webgpu: webgpuAvailable(),
+      gpu: await gpuProbe(),
     };
     try {
       const devs = await app.matrix.devicesOf(app.creatorId, { retry: 0 });
@@ -2054,7 +2091,8 @@ function loginCard() {
       text: "Sign in with my own account",
       onclick: async () => {
         try {
-          await tryLogin({ baseUrl: hs.value.trim(), username: user.value.trim(), password: pass.value });
+          const baseUrl = await homeserverFor(user.value, hs.value.trim() || DEFAULT_HS);
+          await tryLogin({ baseUrl, username: user.value.trim(), password: pass.value });
         } catch (e) {
           toast(`login failed: ${e.message}`);
         }
@@ -2065,6 +2103,47 @@ function loginCard() {
     el("h2", { text: "optional: use your own matrix account" }),
     el("p", { class: "muted", text: "By default every device auto-creates a throwaway account on hyphae.social. Sign in here instead if you want a real account." }),
     out,
+  ]);
+}
+
+/** Signed in with a real account (a generated one keeps its password). */
+function signedIn() {
+  return !!app.session?.creds && !app.session.creds.password;
+}
+
+function signInScreen(onSkip) {
+  const user = el("input", { placeholder: "username or @you:server", autocomplete: "username", autocapitalize: "off" });
+  const pass = el("input", { type: "password", placeholder: "password", autocomplete: "current-password" });
+  const hs = el("input", { value: DEFAULT_HS, placeholder: "https://homeserver" });
+  const err = el("div", { class: "muted small" });
+  const go = el("button", { class: "primary big", text: "Sign in" });
+  const submit = async () => {
+    go.disabled = true;
+    go.textContent = "Signing in…";
+    err.textContent = "";
+    try {
+      const baseUrl = await homeserverFor(user.value, hs.value.trim() || DEFAULT_HS);
+      await tryLogin({ baseUrl, username: user.value.trim(), password: pass.value });
+    } catch (e) {
+      err.textContent = `Couldn't sign in: ${e.message}`;
+      go.disabled = false;
+      go.textContent = "Sign in";
+    }
+  };
+  go.onclick = submit;
+  pass.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  return el("div", { class: "view simple" + (embed ? " embed" : "") }, [
+    el("div", { class: "card center" }, [
+      el("h2", { text: "Sign in" }),
+      el("div", { class: "col" }, [
+        user,
+        pass,
+        el("details", { class: "small" }, [el("summary", { class: "muted", text: "server" }), hs]),
+        go,
+        err,
+      ]),
+      el("button", { class: "ghost small", text: app.session?.creds ? "keep using the temporary account" : "use a temporary account instead", onclick: onSkip }),
+    ]),
   ]);
 }
 
@@ -2705,6 +2784,12 @@ async function main() {
     }
   }
   if (mode === "controller") app.bridgeInfo = await detectBridge();
+  const skipped = sessionStorage.getItem("heimdall.skipSignIn") === "1";
+  if (mode === "controller" && app.bridgeInfo && !signedIn() && !skipped) {
+    // First screen on this computer: who is this fleet for.
+    root.append(signInScreen(() => { sessionStorage.setItem("heimdall.skipSignIn", "1"); location.reload(); }));
+    return;
+  }
   root.append(mode === "controller" ? controllerView() : simple ? simpleWorkerView() : workerView());
   if (mode === "controller" && app.session?.roomId) {
     rejoin();

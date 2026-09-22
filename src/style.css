@@ -520,3 +520,4 @@ code {
 .activity:not(.on) .act-text { opacity: 0.5; }
 .badge.running { background: var(--accent-dim); color: #fff; animation: act-pulse 1s ease-in-out infinite; }
 @keyframes act-pulse { 50% { opacity: 0.45; } }
+.view.simple .card.center .col { max-width: 320px; margin: 12px auto; text-align: left; gap: 8px; }
