@@ -206,19 +206,8 @@ async function onSignal(senderUserId, content) {
   if (content.type === "diag" && mode === "controller") {
     app.diag = app.diag || {};
     app.diag[`${senderUserId}|${content.deviceId}`] = { ...content.state, at: Date.now() };
-    // A phone on an older page than this one: tell it to reload, once a minute at most.
-    // Builds are stamped when built, and this computer's copy and the public
-    // site's are built minutes apart — so only a page clearly OLDER than
-    // this one (or with no stamp at all) is told to reload.
-    const theirs = Date.parse(content.state?.build || "") || 0;
-    if (BUILD !== "dev" && Date.parse(BUILD) - theirs > 10 * 60_000) {
-      app.reloadAsked = app.reloadAsked || {};
-      const k = `${senderUserId}|${content.deviceId}`;
-      if (Date.now() - (app.reloadAsked[k] || 0) > 60_000) {
-        app.reloadAsked[k] = Date.now();
-        app.matrix?.sendSignal({ userId: senderUserId, deviceId: content.deviceId }, { type: "reload", deviceId: app.matrix.deviceId }).catch(() => {});
-      }
-    }
+    // (No remote reload: telling a phone to reload interrupted it mid-job
+    // twice. A stale page is shown in its build stamp here, and reloads by hand.)
     return;
   }
   if (content.type === "reload" && mode === "worker") {
