@@ -253,7 +253,22 @@ async function onSignal(senderUserId, content) {
   if (content.type === "relay" || content.type === "relay-open") {
     const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
     if (mode === "controller") {
-      if (content.type === "relay") app.workers.get(key)?.peer?.deliver?.(content.msgs);
+      if (content.type === "relay") {
+        const rec = app.workers.get(key);
+        if (rec?.peer?.deliver) rec.peer.deliver(content.msgs);
+        else if (rec) {
+          // The horse is still on the relay but our record moved on (a relink):
+          // take the relay back rather than drop its words.
+          rec.peer?.close?.();
+          rec.peer = new RelayPeer({
+            send: (msgs) => app.matrix.sendSignalRetry(rec.device, { type: "relay", deviceId: app.matrix.deviceId, msgs }, 3),
+            onMessage: (msg) => onWorkerMessage(key, rec, msg),
+          });
+          rec.via = "relay";
+          rec.status = "open";
+          rec.peer.deliver(content.msgs);
+        } else console.warn("heimdall: relay batch from an unknown horse", key);
+      }
     } else {
       if (app.creatorId && senderUserId !== app.creatorId) return;
       const remote = { userId: senderUserId, deviceId: content.deviceId };
@@ -283,7 +298,7 @@ async function onSignal(senderUserId, content) {
       if (app.creatorId && senderUserId !== app.creatorId) return;
       const remote = { userId: senderUserId, deviceId: content.deviceId };
       const peer = ensureWorkerPeer(remote);
-      if (peer.opened) return;
+      if (peer.opened || typeof peer.handleSignal !== "function") return;
       peer.handleSignal(content.label, content.data).catch(() => {});
     }
   } else if (content.type === "ready" && mode === "controller") {
@@ -664,8 +679,16 @@ function dropWorker(key) {
   const rec = app.workers.get(key);
   try { rec?.peer?.close(); } catch {}
   app.workers.delete(key);
-  app.connecting.delete(key);
+  // Start the relink cool-down now rather than erasing it — an immediate
+  // re-offer raced the old link's teardown.
+  app.connecting.set(key, Date.now() - 20_000);
   renderFleet();
+}
+
+/** A job is running on this horse right now. */
+function jobInFlight(key) {
+  for (const r of app.relay.values()) if (r.giverKey === key) return true;
+  return (app.route.inflight[key] ?? 0) > 0;
 }
 
 async function reconcile() {
@@ -801,7 +824,7 @@ function ensureWorkerLink(key, device) {
       const retry = setTimeout(() => {
         // Only reap OUR record: a relink may already hold a new one under
         // this key (dropWorker + reconcile run inside 5s).
-        if (app.workers.get(key) !== rec) return;
+        if (app.workers.get(key) !== rec || rec.peer !== peer) return; // swapped to the relay: not ours to reap
         app.workers.delete(key);
         app.connecting.delete(key);
         reconcile();
@@ -846,6 +869,7 @@ function noteObserved(giverKey, ms, ok) {
 }
 
 function onWorkerMessage(key, rec, msg) {
+  rec.lastSeen = Date.now(); // any word from the horse — tokens of a long answer included — is life
   // A relayed job: worker borrowed from the fleet, tokens come back via the hub.
   if (msg.type === "token" && app.relay.has(msg.id)) {
     const r = app.relay.get(msg.id);
@@ -2799,7 +2823,7 @@ function controllerTick() {
       rec.standing = standing;
       changed = true;
     }
-    if (shouldRelink(rec, now) && rec.status !== "lost") {
+    if (shouldRelink(rec, now) && rec.status !== "lost" && !jobInFlight(key)) {
       dropWorker(key);
       reconcile();
       changed = true;

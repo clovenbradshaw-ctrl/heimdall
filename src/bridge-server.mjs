@@ -154,9 +154,16 @@ export function createBridge({
       return json(res, 404, { error: `model "${model}" not found in the fleet (no phone holds it, and pass-through is off)` });
     }
     try {
+      // The caller's identity and Heimdall's hop marks ride through (2026-09-21):
+      // upstream is Heimdall's channel, which keys the line per SERVER and
+      // must see the original caller, not the bridge; and a turn the channel
+      // sent HERE that fell through must re-enter marked, never re-queue.
+      const headers = { "content-type": req.headers["content-type"] || "application/json" };
+      for (const [k, v] of Object.entries(req.headers)) if (/^x-(er7|heimdall)-/.test(k) && typeof v === "string") headers[k] = v;
+      if (!headers["x-er7-user"] && !headers["x-er7-caller"] && !headers["x-er7-session"]) headers["x-er7-caller"] = `heimdall-bridge:${port}`;
       const r = await fetch(upstream + urlPath, {
         method: req.method,
-        headers: { "content-type": req.headers["content-type"] || "application/json" },
+        headers,
         body: req.method === "GET" || req.method === "HEAD" ? undefined : raw,
       });
       res.writeHead(r.status, { "content-type": r.headers.get("content-type") || "application/json" });

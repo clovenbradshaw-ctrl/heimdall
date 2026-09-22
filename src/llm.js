@@ -212,63 +212,68 @@ export const WASM_MODEL = { id: "Qwen2.5-0.5B-Instruct-onnx-q4", repo: "onnx-com
 export class WasmEngine {
   constructor(onProgress) {
     this.onProgress = onProgress || (() => {});
-    this.gen = null;
+    this.worker = null;
     this.modelId = null;
     this.pending = 0;
     this.queue = Promise.resolve();
     this.cpu = true;
+    this.waiting = new Map(); // id -> { resolve, reject, onToken }
+    this.seq = 0;
   }
 
   get loaded() {
-    return !!this.gen;
+    return !!this.modelId;
   }
 
   get contextWindow() {
     return null;
   }
 
-  async load() {
-    if (this.gen) return;
-    const { pipeline } = await import("@huggingface/transformers");
-    const files = new Map();
-    this.gen = await pipeline("text-generation", WASM_MODEL.repo, {
-      dtype: "q4",
-      device: "wasm",
-      progress_callback: (p) => {
-        if (p.status !== "progress" || !p.total) return;
-        files.set(p.file, [p.loaded, p.total]);
-        let got = 0;
-        let all = 0;
-        for (const [l, t] of files.values()) { got += l; all += t; }
-        this.onProgress({ progress: all ? got / all : 0 });
-      },
+  _ensureWorker() {
+    if (this.worker) return;
+    // Its own thread: a generation blocks only the worker, never the page.
+    this.worker = new Worker(new URL("./llm-worker.js", import.meta.url), { type: "module" });
+    this.worker.onmessage = ({ data }) => {
+      if (data.type === "progress") return this.onProgress({ progress: data.progress });
+      const w = this.waiting.get(data.id);
+      if (!w) return;
+      if (data.type === "token") return w.onToken?.(data.t);
+      this.waiting.delete(data.id);
+      if (data.type === "error") w.reject(new Error(data.message));
+      else w.resolve(data);
+    };
+    this.worker.onerror = (e) => {
+      for (const w of this.waiting.values()) w.reject(new Error(e.message || "model worker crashed"));
+      this.waiting.clear();
+    };
+  }
+
+  _call(type, payload, onToken) {
+    this._ensureWorker();
+    const id = ++this.seq;
+    return new Promise((resolve, reject) => {
+      this.waiting.set(id, { resolve, reject, onToken });
+      this.worker.postMessage({ id, type, payload });
     });
+  }
+
+  async load() {
+    if (this.modelId) return;
+    await this._call("load", { repo: WASM_MODEL.repo });
     this.modelId = WASM_MODEL.id;
     this.onProgress({ progress: 1 });
   }
 
   infer(messages, opts = {}, onToken) {
     this.pending++;
-    const task = this.queue.then(() => this._run(messages, opts, onToken));
+    const run = async () => {
+      const r = await this._call("infer", { messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.max_tokens ?? 512 }, onToken);
+      return { text: r.text };
+    };
+    const task = this.queue.then(run);
     const done = () => { this.pending = Math.max(0, this.pending - 1); };
     task.then(done, done);
     this.queue = task.then(() => {}, () => {});
     return task;
-  }
-
-  async _run(messages, { temperature = 0.7, max_tokens = 512 } = {}, onToken) {
-    const { TextStreamer } = await import("@huggingface/transformers");
-    let text = "";
-    const streamer = new TextStreamer(this.gen.tokenizer, {
-      skip_prompt: true,
-      skip_special_tokens: true,
-      callback_function: (t) => {
-        if (!t) return;
-        text += t;
-        onToken?.(t);
-      },
-    });
-    await this.gen(messages, { max_new_tokens: max_tokens, temperature, do_sample: temperature > 0, streamer });
-    return { text };
   }
 }
