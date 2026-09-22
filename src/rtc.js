@@ -106,3 +106,51 @@ export class RtcPeer {
     } catch {}
   }
 }
+/**
+ * The same surface as RtcPeer, carried over Matrix to-device messages
+ * instead of a DataChannel — for when a direct link cannot open (a phone on
+ * a carrier NAT, and no TURN server). Slower, but it goes wherever the
+ * pairing already went. Tokens are batched; everything else is sent at
+ * once; batches leave in order.
+ */
+export class RelayPeer {
+  constructor({ send, onMessage, batchMs = 250 }) {
+    this.sendBatch = send; // (msgs[]) => Promise
+    this.onMessage = onMessage || (() => {});
+    this.batchMs = batchMs;
+    this.opened = true;
+    this.relay = true;
+    this.queue = [];
+    this.timer = null;
+    this.chain = Promise.resolve();
+  }
+
+  send(msg) {
+    if (!this.opened) return;
+    this.queue.push(msg);
+    if (msg.type === "token") {
+      if (!this.timer) this.timer = setTimeout(() => this.flush(), this.batchMs);
+    } else {
+      this.flush();
+    }
+  }
+
+  flush() {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.queue.length) return;
+    const msgs = this.queue.splice(0);
+    this.chain = this.chain.then(() => this.sendBatch(msgs)).catch(() => {});
+  }
+
+  /** Messages that arrived from the far end. */
+  deliver(msgs) {
+    if (!this.opened) return;
+    for (const m of Array.isArray(msgs) ? msgs : []) this.onMessage(m);
+  }
+
+  close() {
+    this.flush();
+    this.opened = false;
+  }
+}

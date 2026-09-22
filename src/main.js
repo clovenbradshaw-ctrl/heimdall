@@ -9,7 +9,9 @@ import {
   deviceKey,
   sha256Hex,
 } from "./matrix.js";
-import { RtcPeer } from "./rtc.js";
+import { RtcPeer, RelayPeer } from "./rtc.js";
+// A direct link that has not opened by now falls back to the Matrix relay.
+const RELAY_AFTER_MS = 10_000;
 import { WorkerEngine, OllamaEngine, MODEL_CHOICES, DEFAULT_MODEL, FALLBACK_MODEL, webgpuAvailable } from "./llm.js";
 import { answers, ollamaTagOf } from "./models.js";
 import { detectBridge, connectBridge } from "./bridge-client.js";
@@ -215,6 +217,18 @@ async function onSignal(senderUserId, content) {
       sameAccount: senderUserId === app.matrix.userId,
     });
     renderFleet();
+    return;
+  }
+  if (content.type === "relay" || content.type === "relay-open") {
+    const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
+    if (mode === "controller") {
+      if (content.type === "relay") app.workers.get(key)?.peer?.deliver?.(content.msgs);
+    } else {
+      if (app.creatorId && senderUserId !== app.creatorId) return;
+      const remote = { userId: senderUserId, deviceId: content.deviceId };
+      if (content.type === "relay-open") openWorkerRelay(remote);
+      else (app.peers.get(key)?.relay ? app.peers.get(key) : openWorkerRelay(remote)).deliver(content.msgs);
+    }
     return;
   }
   if (content.type === "signal") {
@@ -748,6 +762,21 @@ function ensureWorkerLink(key, device) {
     app.workers.delete(key);
     app.connecting.delete(key);
   });
+  const fallback = setTimeout(() => {
+    if (app.workers.get(key) !== rec || rec.peer !== peer || peer.opened) return;
+    peer.onClose = () => {};
+    peer.close();
+    rec.peer = new RelayPeer({
+      send: (msgs) => app.matrix.sendSignalRetry(device, { type: "relay", deviceId: app.matrix.deviceId, msgs }, 3),
+      onMessage: (msg) => onWorkerMessage(key, rec, msg),
+    });
+    rec.via = "relay";
+    rec.status = "open";
+    rec.lastSeen = Date.now();
+    app.matrix.sendSignalRetry(device, { type: "relay-open", deviceId: app.matrix.deviceId }, 3).catch(() => {});
+    renderFleet();
+  }, RELAY_AFTER_MS);
+  app.timers.push(fallback);
 }
 
 function selfGiver() {
@@ -1687,6 +1716,39 @@ async function announceReady() {
       3,
     );
   }
+}
+
+/** The worker's side of the relay: the host found no direct path. */
+function openWorkerRelay(remoteDevice) {
+  const key = deviceKey(remoteDevice);
+  const old = app.peers.get(key);
+  if (old?.relay) return old;
+  if (old) {
+    old.onClose = () => {};
+    old.close();
+  }
+  const peer = new RelayPeer({
+    send: (msgs) => app.matrix.sendSignalRetry(remoteDevice, { type: "relay", deviceId: app.matrix.deviceId, msgs }, 3),
+    onMessage: (msg) => onWorkerRtcMessage(peer, msg),
+  });
+  app.peers.set(key, peer);
+  peer.send(workerHello());
+  renderWorkerStatus();
+  return peer;
+}
+
+function workerHello() {
+  return {
+    type: "hello",
+    role: "worker",
+    deviceId: app.matrix.deviceId,
+    model: app.engine?.modelId || app.modelId,
+    ctx: app.engine?.contextWindow ?? null,
+    queueDepth: app.engine?.pending ?? 0,
+    name: deviceName(),
+    ua: navigator.userAgent,
+    leaseUntil: app.leaseUntil,
+  };
 }
 
 function ensureWorkerPeer(remoteDevice) {
