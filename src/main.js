@@ -554,7 +554,9 @@ function bridgeState() {
     model: modelOf(rec),
     ctx: rec.hello?.ctx ?? null,
     standing: standingOf(rec, now),
-    ready: isEligible(rec, now),
+    // Routable only once the phone has tapped Start (a live lease) and says
+    // which weights are actually loaded.
+    ready: isEligible(rec, now) && !!modelOf(rec) && (rec.hello?.leaseUntil ?? 0) > now,
   }));
   const s = selfGiver();
   // This tab lending WebLLM is one more giver the bridge may use; a lent
@@ -1604,7 +1606,7 @@ async function acceptDuty() {
             type: "ping",
             t: Date.now(),
             queueDepth: app.engine?.pending ?? 0,
-            model: app.engine?.modelId || app.modelId,
+            model: app.engine?.loaded ? app.engine.modelId : null,
             ctx: app.engine?.contextWindow ?? null,
           });
         }
@@ -1788,7 +1790,7 @@ async function announceReady() {
       {
         type: "ready",
         deviceId: app.matrix.deviceId,
-        model: app.engine?.modelId || app.modelId, // the weights actually loaded, never the picker alone
+        model: app.engine?.loaded ? app.engine.modelId : null, // the weights actually loaded, never the picker alone
         queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
         leaseUntil: app.leaseUntil,
@@ -1864,7 +1866,7 @@ function workerHello() {
     type: "hello",
     role: "worker",
     deviceId: app.matrix.deviceId,
-    model: app.engine?.modelId || app.modelId,
+    model: app.engine?.loaded ? app.engine.modelId : null,
     ctx: app.engine?.contextWindow ?? null,
     queueDepth: app.engine?.pending ?? 0,
     name: deviceName(),
@@ -1887,7 +1889,7 @@ function ensureWorkerPeer(remoteDevice) {
         type: "hello",
         role: "worker",
         deviceId: app.matrix.deviceId,
-        model: app.engine?.modelId || app.modelId, // the weights actually loaded, never the picker alone
+        model: app.engine?.loaded ? app.engine.modelId : null, // the weights actually loaded, never the picker alone
         ctx: app.engine?.contextWindow ?? null,
         queueDepth: app.engine?.pending ?? 0,
         name: deviceName(),
