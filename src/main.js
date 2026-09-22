@@ -61,6 +61,7 @@ const mode = share ? "worker" : "controller";
 // ?embed: the controller shown inside another page (the Fold's Heimdall
 // sheet) — just the pairing and the devices, none of the page chrome.
 const embed = new URLSearchParams(location.search).has("embed");
+const BUILD = typeof __BUILD__ === "string" ? __BUILD__ : "dev";
 // A QR link carries its own pairing secret, so the phone page can be one
 // button: nothing to read out, nothing to type.
 const simple = mode === "worker" && !!share?.key;
@@ -205,6 +206,20 @@ async function onSignal(senderUserId, content) {
   if (content.type === "diag" && mode === "controller") {
     app.diag = app.diag || {};
     app.diag[`${senderUserId}|${content.deviceId}`] = { ...content.state, at: Date.now() };
+    // A phone on an older page than this one: tell it to reload, once a minute at most.
+    if (content.state?.build !== BUILD && BUILD !== "dev") {
+      app.reloadAsked = app.reloadAsked || {};
+      const k = `${senderUserId}|${content.deviceId}`;
+      if (Date.now() - (app.reloadAsked[k] || 0) > 60_000) {
+        app.reloadAsked[k] = Date.now();
+        app.matrix?.sendSignal({ userId: senderUserId, deviceId: content.deviceId }, { type: "reload", deviceId: app.matrix.deviceId }).catch(() => {});
+      }
+    }
+    return;
+  }
+  if (content.type === "reload" && mode === "worker") {
+    if (app.creatorId && senderUserId !== app.creatorId) return;
+    if (!activity.running) location.reload();
     return;
   }
   // Sibling heimdall load snapshots (same account, another surface). Only
@@ -1821,6 +1836,7 @@ function startWorkerDiag() {
     if (!app.matrix || !app.creatorId) return;
     const state = {
       page: "simple:" + simple,
+      build: BUILD,
       model: app.engine?.modelId || null,
       loaded: !!app.engine?.loaded,
       status: statusEl?.textContent?.slice(0, 120) || "",
