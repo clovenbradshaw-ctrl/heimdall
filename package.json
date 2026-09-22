@@ -16,6 +16,7 @@
     "heimdall": "./bin/heimdall.mjs"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@mlc-ai/web-llm": "^0.2.85",
     "matrix-js-sdk": "^42.4.0",
     "qrcode-generator": "^1.5.2",

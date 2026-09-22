@@ -12,7 +12,7 @@ import {
 import { RtcPeer, RelayPeer } from "./rtc.js";
 // A direct link that has not opened by now falls back to the Matrix relay.
 const RELAY_AFTER_MS = 10_000;
-import { WorkerEngine, OllamaEngine, MODEL_CHOICES, DEFAULT_MODEL, FALLBACK_MODEL, webgpuAvailable } from "./llm.js";
+import { WorkerEngine, OllamaEngine, WasmEngine, MODEL_CHOICES, DEFAULT_MODEL, FALLBACK_MODEL, webgpuAvailable } from "./llm.js";
 import { answers, ollamaTagOf } from "./models.js";
 import { detectBridge, connectBridge } from "./bridge-client.js";
 import qrcode from "qrcode-generator";
@@ -1607,7 +1607,29 @@ async function acceptDuty() {
  *  device; a second visit loads from the cache. If the default model will
  *  not load here (memory, GPU), fall back to the small one — unless the
  *  person picked the model themselves. */
+/** No usable GPU: run the small model on the CPU instead of giving up. */
+async function loadOnCpu() {
+  const onProgress = (p) => {
+    const pct = Math.round((p.progress || 0) * 100);
+    if (pct > 0 && pct < 100) progressEl.hidden = false;
+    progressFillEl.style.width = `${pct}%`;
+    modelStatusEl.textContent = pct < 100 ? `Downloading the model (no GPU — using the processor)… ${pct}%` : "Starting the model…";
+  };
+  app.engine = new WasmEngine(onProgress);
+  try {
+    await app.engine.load();
+    progressEl.hidden = true;
+    app.modelId = app.engine.modelId;
+    modelStatusEl.textContent = simple ? "Ready (on the processor — no GPU)." : `${app.engine.modelId} — ready on the CPU`;
+    renderWorkerStatus();
+  } catch (e) {
+    progressEl.hidden = true;
+    modelStatusEl.textContent = `model failed to load: ${e?.message || e}`;
+  }
+}
+
 async function prefetchModel() {
+  if (!webgpuAvailable()) return loadOnCpu();
   if (!webgpuAvailable()) {
     modelStatusEl.textContent = simple
       ? "This browser can't use the phone's GPU. Open this link in Chrome."
@@ -1631,6 +1653,10 @@ async function prefetchModel() {
     renderWorkerStatus();
   } catch (e) {
     progressEl.hidden = true;
+    if (/GPU|adapter|WebGPU/i.test(String(e?.message || e))) {
+      toast("no usable GPU here — running on the processor instead");
+      return loadOnCpu();
+    }
     if (!app.modelChosen && want !== FALLBACK_MODEL) {
       toast(`${labelOf(want)} didn't fit on this device — using a smaller model`);
       app.modelId = FALLBACK_MODEL;

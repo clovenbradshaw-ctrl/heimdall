@@ -201,3 +201,74 @@ export class OllamaEngine {
     }
   }
 }
+
+/**
+ * The CPU path: a small model through transformers.js on WebAssembly, for a
+ * browser that exposes no usable GPU (Brave on Android, a blocklisted GPU).
+ * Slower than WebLLM, but it runs anywhere. Same surface as WorkerEngine.
+ */
+export const WASM_MODEL = { id: "Qwen2.5-0.5B-Instruct-onnx-q4", repo: "onnx-community/Qwen2.5-0.5B-Instruct" };
+
+export class WasmEngine {
+  constructor(onProgress) {
+    this.onProgress = onProgress || (() => {});
+    this.gen = null;
+    this.modelId = null;
+    this.pending = 0;
+    this.queue = Promise.resolve();
+    this.cpu = true;
+  }
+
+  get loaded() {
+    return !!this.gen;
+  }
+
+  get contextWindow() {
+    return null;
+  }
+
+  async load() {
+    if (this.gen) return;
+    const { pipeline } = await import("@huggingface/transformers");
+    const files = new Map();
+    this.gen = await pipeline("text-generation", WASM_MODEL.repo, {
+      dtype: "q4",
+      device: "wasm",
+      progress_callback: (p) => {
+        if (p.status !== "progress" || !p.total) return;
+        files.set(p.file, [p.loaded, p.total]);
+        let got = 0;
+        let all = 0;
+        for (const [l, t] of files.values()) { got += l; all += t; }
+        this.onProgress({ progress: all ? got / all : 0 });
+      },
+    });
+    this.modelId = WASM_MODEL.id;
+    this.onProgress({ progress: 1 });
+  }
+
+  infer(messages, opts = {}, onToken) {
+    this.pending++;
+    const task = this.queue.then(() => this._run(messages, opts, onToken));
+    const done = () => { this.pending = Math.max(0, this.pending - 1); };
+    task.then(done, done);
+    this.queue = task.then(() => {}, () => {});
+    return task;
+  }
+
+  async _run(messages, { temperature = 0.7, max_tokens = 512 } = {}, onToken) {
+    const { TextStreamer } = await import("@huggingface/transformers");
+    let text = "";
+    const streamer = new TextStreamer(this.gen.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function: (t) => {
+        if (!t) return;
+        text += t;
+        onToken?.(t);
+      },
+    });
+    await this.gen(messages, { max_new_tokens: max_tokens, temperature, do_sample: temperature > 0, streamer });
+    return { text };
+  }
+}

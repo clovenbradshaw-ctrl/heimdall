@@ -17,6 +17,7 @@ export const OLLAMA_TAG = Object.freeze({
   "gemma-2-2b-it-q4f32_1-MLC": "gemma2:2b",
   "Qwen2.5-0.5B-Instruct-q4f16_1-MLC": "qwen2.5:0.5b",
   "Qwen2.5-0.5B-Instruct-q4f32_1-MLC": "qwen2.5:0.5b",
+  "Qwen2.5-0.5B-Instruct-onnx-q4": "qwen2.5:0.5b", // the CPU (WebAssembly) build — no GPU needed
   "Qwen3-1.7B-q4f16_1-MLC": "qwen3:1.7b",
   "Qwen3-1.7B-q4f32_1-MLC": "qwen3:1.7b",
   "Qwen3-4B-q4f16_1-MLC": "qwen3:4b",
