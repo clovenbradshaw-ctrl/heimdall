@@ -46,6 +46,7 @@ export const isRoomMouth = (name) =>
 export function isEligible(rec, now = Date.now()) {
   if (!rec) return false;
   if (rec.status !== "ready") return false;
+  if (rec.hidden) return false; // the phone left the app: held, never routed to
   if (!rec.peer?.opened) return false;
   if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil) return false;
   // A horse not heard from in 3 pings is stale: shown, never routed to

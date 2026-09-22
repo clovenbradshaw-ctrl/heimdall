@@ -62,6 +62,20 @@ const mode = share ? "worker" : "controller";
 // sheet) — just the pairing and the devices, none of the page chrome.
 const embed = new URLSearchParams(location.search).has("embed");
 const BUILD = typeof __BUILD__ === "string" ? __BUILD__ : "dev";
+// One id per physical device, kept across sessions and accounts on it, so
+// the host keeps one entry per phone however many times it re-pairs.
+const HWID = (() => {
+  try {
+    let id = localStorage.getItem("heimdall.hwid");
+    if (!id) {
+      id = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem("heimdall.hwid", id);
+    }
+    return id;
+  } catch {
+    return null;
+  }
+})();
 // A QR link carries its own pairing secret, so the phone page can be one
 // button: nothing to read out, nothing to type.
 const simple = mode === "worker" && !!share?.key;
@@ -106,6 +120,8 @@ const app = {
   revokedAt: 0, // when it was last read from the account
   reconcileTimer: null, // exactly one reconcile loop per page, however many times we (re)join
   removed: null, // worker: { reason, via } once the host removed this device
+  heard: new Map(), // controller: deviceKey -> last time that device said anything
+  retired: new Set(), // controller: older sessions of a device that re-paired
   bridge: null, // controller: the local bridge connection (bridge-client.js), when `heimdall up` serves this page
   bridgeInfo: null,
   ownDevices: new Set(), // controller: deviceKeys the host marked as their own (borrow without credit)
@@ -114,6 +130,7 @@ const app = {
 };
 
 const REVOKED_REFRESH_MS = 60_000;
+const HEARD_WITHIN_MS = 10 * 60_000;
 
 /* ---------------------------------------------------------------- storage */
 
@@ -201,7 +218,26 @@ async function tryLogin({ baseUrl, username, password }) {
 
 /* ------------------------------------------------------------- signaling */
 
+/** One entry per physical device: a newer session from the same phone
+ *  retires the older ones. */
+function retireOtherSessions(key, hwid) {
+  if (!hwid) return;
+  for (const [k, r] of app.workers) {
+    if (k !== key && r.hwid === hwid) {
+      dropWorker(k);
+      app.retired.add(k);
+    }
+  }
+}
+
 async function onSignal(senderUserId, content) {
+  // Anything a device says to us means it is alive now; only devices heard
+  // from recently are offered links (never every device the room remembers).
+  if (mode === "controller" && content?.deviceId && senderUserId) {
+    const k = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
+    app.heard.set(k, Date.now());
+    if (content.hwid) app.retired.delete(k);
+  }
   // Diagnostics: what a phone says about itself, kept by the host.
   if (content.type === "diag" && mode === "controller") {
     app.diag = app.diag || {};
@@ -309,6 +345,8 @@ async function onSignal(senderUserId, content) {
     const rec = app.workers.get(key);
     // A relayed horse whose hello went to an earlier page of ours: its ready
     // announcement carries everything the hello did.
+    if (rec && content.hidden != null) rec.hidden = !!content.hidden;
+    if (rec && content.hwid && rec.hwid !== content.hwid) { rec.hwid = content.hwid; retireOtherSessions(key, content.hwid); }
     if (rec?.peer?.relay && rec.peer.opened && !rec.hello) {
       rec.hello = { model: content.model ?? null, name: content.name, leaseUntil: content.leaseUntil, queueDepth: content.queueDepth ?? 0 };
       rec.status = "ready";
@@ -621,7 +659,9 @@ function renderBridge() {
       ? `Running on ${busy.map(([, r]) => nameOf(r)).join(", ")} now`
       : ready.length
         ? `${ready.map(([, r]) => `${nameOf(r)} ready (${labelOf(modelOf(r))})`).join(", ")}`
-        : app.workers.size
+        : [...app.workers.values()].some((r) => r.hidden)
+          ? "Phone left the app — open heimdall on it to resume"
+          : app.workers.size
           ? "Phone connecting…"
           : "Waiting for a phone";
   bridgeStatusEl.replaceChildren(
@@ -708,6 +748,9 @@ async function reconcile() {
       for (const device of devs) {
         if (userId === app.matrix.userId && String(device.deviceId) === String(app.matrix.deviceId)) continue; // this page
         if (app.controllers.has(deviceKey(device))) continue; // another heimdall, not a horse
+        const heardAt = app.heard.get(deviceKey(device)) || 0;
+        if (Date.now() - heardAt > HEARD_WITHIN_MS) continue; // silent for long: an old session, not a phone
+        if (app.retired.has(deviceKey(device))) continue;
         const key = deviceKey(device);
         if (isRevoked(app.revoked, device)) continue; // removed stays removed
         if (app.workers.has(key)) continue;
@@ -895,6 +938,11 @@ function onWorkerMessage(key, rec, msg) {
   if (msg.type === "job") {
     onBorrowJob(key, rec, msg);
     return;
+  }
+  if (msg.hidden != null) rec.hidden = !!msg.hidden;
+  if (msg.hwid) {
+    if (rec.hwid !== msg.hwid) retireOtherSessions(key, msg.hwid);
+    rec.hwid = msg.hwid;
   }
   if (msg.type === "hello") {
     rec.hello = msg;
@@ -1627,6 +1675,8 @@ async function acceptDuty() {
         if (peer.opened) {
           peer.send({
             type: "ping",
+            hwid: HWID,
+            hidden: document.hidden,
             t: Date.now(),
             queueDepth: app.engine?.pending ?? 0,
             model: app.engine?.loaded ? app.engine.modelId : null,
@@ -1636,6 +1686,18 @@ async function acceptDuty() {
       }
     }, 15000);
     await keepAwake();
+    if (!app.visibilityHooked) {
+      app.visibilityHooked = true;
+      // Leaving the app throttles (then freezes) this page: say so now, so
+      // the host holds our place instead of timing us out; say so again on
+      // return, so work resumes at once.
+      document.addEventListener("visibilitychange", () => {
+        for (const peer of app.peers.values()) {
+          if (peer.opened) peer.send({ type: "ping", hwid: HWID, hidden: document.hidden, t: Date.now(), queueDepth: app.engine?.pending ?? 0, model: app.engine?.loaded ? app.engine.modelId : null });
+        }
+        if (!document.hidden) announceReady().catch(() => {});
+      });
+    }
     renderWorkerStatus();
     updateComposer();
     toast("you are compute now. keep this tab open.");
@@ -1812,6 +1874,8 @@ async function announceReady() {
       device,
       {
         type: "ready",
+        hwid: HWID,
+        hidden: document.hidden,
         deviceId: app.matrix.deviceId,
         model: app.engine?.loaded ? app.engine.modelId : null, // the weights actually loaded, never the picker alone
         queueDepth: app.engine?.pending ?? 0,
@@ -1889,6 +1953,8 @@ function startWorkerDiag() {
 
 function workerHello() {
   return {
+    hwid: HWID,
+    hidden: document.hidden,
     type: "hello",
     role: "worker",
     deviceId: app.matrix.deviceId,
@@ -1912,6 +1978,8 @@ function ensureWorkerPeer(remoteDevice) {
     onOpen: () => {
       renderWorkerStatus();
       peer.send({
+        hwid: HWID,
+        hidden: document.hidden,
         type: "hello",
         role: "worker",
         deviceId: app.matrix.deviceId,
@@ -2448,7 +2516,7 @@ function renderFleet() {
   for (const [key, rec] of app.workers) {
     const h = rec.hello;
     const standing = standingOf(rec);
-    const color = standing === "ready" ? "ok" : standing === "stale" ? "warn" : standing === "linking" ? "warn" : "err";
+    const color = standing === "ready" ? "ok" : standing === "stale" || standing === "linking" || standing === "away" ? "warn" : "err";
     const name = h?.name || rec.device.userId;
     const queue = rec.queueDepth ? ` · queued ${rec.queueDepth}` : "";
     const pace = app.route.meanMs[key] ? ` · ~${Math.round(app.route.meanMs[key] / 100) / 10}s avg` : "";

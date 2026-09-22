@@ -29,6 +29,9 @@
 export const PING_EVERY_MS = 15_000;
 export const STALE_AFTER_MS = 45_000; // 3 missed pings
 export const DEAD_AFTER_MS = 90_000; // 6 missed pings → relink
+// A phone that said it left the app (tab hidden): its timers are throttled
+// and it may be frozen. Held, never routed to, and only given up on after this.
+export const AWAY_HOLD_MS = 30 * 60_000;
 
 /** Derive a worker's standing from evidence the controller already keeps.
  *  `rec.lastSeen` is the last ping/hello/lease/result; null = never heard
@@ -40,6 +43,7 @@ export function standingOf(rec, now = Date.now()) {
   if (rec.hello?.leaseUntil && now > rec.hello.leaseUntil) return "expired";
   if (rec.lastSeen == null) return rec.hello ? "ready" : "linking";
   const silent = now - rec.lastSeen;
+  if (rec.hidden) return silent >= AWAY_HOLD_MS ? "dead" : "away";
   if (silent >= DEAD_AFTER_MS) return "dead";
   if (silent >= STALE_AFTER_MS) return "stale";
   return rec.hello ? "ready" : "linking";
