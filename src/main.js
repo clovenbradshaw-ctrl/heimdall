@@ -303,6 +303,15 @@ async function onSignal(senderUserId, content) {
     // re-offers — the phone woke up, the tab came back, the NAT moved.
     const key = deviceKey({ userId: senderUserId, deviceId: content.deviceId });
     const rec = app.workers.get(key);
+    // A relayed horse whose hello went to an earlier page of ours: its ready
+    // announcement carries everything the hello did.
+    if (rec?.peer?.relay && rec.peer.opened && !rec.hello) {
+      rec.hello = { model: content.model ?? null, name: content.name, leaseUntil: content.leaseUntil, queueDepth: content.queueDepth ?? 0 };
+      rec.status = "ready";
+      rec.lastSeen = Date.now();
+      renderFleet();
+      return;
+    }
     if (rec && standingOf(rec) !== "ready" && standingOf(rec) !== "linking") dropWorker(key);
     reconcile();
   } else if (content.type === "revoked" && mode === "worker") {
@@ -1804,7 +1813,10 @@ async function announceReady() {
 function openWorkerRelay(remoteDevice) {
   const key = deviceKey(remoteDevice);
   const old = app.peers.get(key);
-  if (old?.relay) return old;
+  if (old?.relay) {
+    old.send(workerHello()); // the host's page may be new: introduce ourselves again
+    return old;
+  }
   if (old) {
     old.onClose = () => {};
     old.close();
