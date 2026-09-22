@@ -140,6 +140,23 @@ export class MatrixPeer {
     return create ? create.getSender() : null;
   }
 
+  /** The creator, read from the server when the room is not synced yet — a
+   *  fresh join resolves before its state arrives, and reading "no creator"
+   *  there made every honest link look like an impersonation. */
+  async roomCreatorFetched() {
+    for (let i = 0; i < 10; i++) {
+      const local = this.roomCreator();
+      if (local) return local;
+      try {
+        const events = await this.client.roomState(this.roomId);
+        const create = events.find((e) => e.type === "m.room.create");
+        if (create?.sender) return create.sender;
+      } catch { /* not readable yet */ }
+      await sleep(1000);
+    }
+    return null;
+  }
+
   /**
    * Discover the E2EE-capable devices of a user. Retries because the
    * freshly-joined worker needs a sync cycle to upload its keys first.

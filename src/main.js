@@ -1460,12 +1460,17 @@ async function acceptDuty() {
   try {
     const matrix = await ensureMatrix();
     await matrix.joinRoom(app.roomId);
-    app.creatorId = matrix.roomCreator();
+    app.creatorId = await matrix.roomCreatorFetched();
     renderIdentity();
 
     // Hard consent gate: the identity claimed on the link must actually own
     // the room. Otherwise a forged link+code could route a device into a
     // stranger's fleet while impersonating the intended host.
+    if (!app.creatorId) {
+      reenableAccept();
+      statusEl.textContent = "Couldn't reach the room — check the connection and tap Start again.";
+      return;
+    }
     if (share.host && app.creatorId !== share.host) {
       reenableAccept();
       statusEl.textContent = `blocked: the room belongs to ${app.creatorId}, not ${share.host}`;
@@ -1539,22 +1544,25 @@ async function acceptDuty() {
  *  person picked the model themselves. */
 async function prefetchModel() {
   if (!webgpuAvailable()) {
-    modelStatusEl.textContent = "This browser has no WebGPU, so it can't run a model. On iPhone use Safari (iOS 26+); on Android use Chrome.";
+    modelStatusEl.textContent = simple
+      ? "This browser can't use the phone's GPU. Open this link in Chrome."
+      : "This browser has no WebGPU, so it can't run a model. On iPhone use Safari (iOS 26+); on Android use Chrome.";
     return;
   }
   if (!app.engine) {
     app.engine = new WorkerEngine((p) => {
       if (p.progress > 0 && p.progress < 1) progressEl.hidden = false;
       progressFillEl.style.width = `${Math.round((p.progress || 0) * 100)}%`;
-      modelStatusEl.textContent = p.text || "downloading model";
+      const pct = Math.round((p.progress || 0) * 100);
+      modelStatusEl.textContent = simple ? (pct < 100 ? `Downloading the model… ${pct}%` : "Starting the model…") : p.text || "downloading model";
     });
   }
   const want = app.modelId;
   try {
-    modelStatusEl.textContent = `getting ${labelOf(want)} ready…`;
+    modelStatusEl.textContent = simple ? "Getting ready…" : `getting ${labelOf(want)} ready…`;
     await app.engine.load(want);
     progressEl.hidden = true;
-    modelStatusEl.textContent = `${labelOf(app.engine.modelId)} ready`;
+    modelStatusEl.textContent = simple ? "Ready." : `${labelOf(app.engine.modelId)} ready`;
     renderWorkerStatus();
   } catch (e) {
     progressEl.hidden = true;
@@ -2282,7 +2290,6 @@ function simpleWorkerView() {
   const view = el("div", { class: "view simple" }, [
     el("div", { class: "card" }, [
       el("h2", { text: "Lend this phone" }),
-      webgpuAvailable() ? null : el("div", { class: "alert warn", text: "This browser can't run models (no WebGPU). Use Safari on iOS 26+ or Chrome on Android." }),
       modelStatusEl,
       progressEl,
       el("div", { style: "height:8px" }),
