@@ -207,7 +207,11 @@ async function onSignal(senderUserId, content) {
     app.diag = app.diag || {};
     app.diag[`${senderUserId}|${content.deviceId}`] = { ...content.state, at: Date.now() };
     // A phone on an older page than this one: tell it to reload, once a minute at most.
-    if (content.state?.build !== BUILD && BUILD !== "dev") {
+    // Builds are stamped when built, and this computer's copy and the public
+    // site's are built minutes apart — so only a page clearly OLDER than
+    // this one (or with no stamp at all) is told to reload.
+    const theirs = Date.parse(content.state?.build || "") || 0;
+    if (BUILD !== "dev" && Date.parse(BUILD) - theirs > 10 * 60_000) {
       app.reloadAsked = app.reloadAsked || {};
       const k = `${senderUserId}|${content.deviceId}`;
       if (Date.now() - (app.reloadAsked[k] || 0) > 60_000) {
