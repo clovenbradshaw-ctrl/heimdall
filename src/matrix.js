@@ -46,7 +46,16 @@ export class MatrixPeer {
     });
     // Encrypted to-device events are decrypted for us; the type is the
     // original (our SIGNAL_TYPE) and the content is our payload.
+    this.recvLog = []; // diagnostics: every to-device event, decrypted or not
     this.client.on(ClientEvent.ToDeviceEvent, (event) => {
+      this.recvLog.push({
+        type: event.getType(),
+        kind: event.getType() === SIGNAL_TYPE ? event.getContent()?.type : null,
+        from: event.getSender(),
+        failed: !!event.isDecryptionFailure?.(),
+        at: Date.now(),
+      });
+      if (this.recvLog.length > 40) this.recvLog.shift();
       if (event.getType() !== SIGNAL_TYPE) return;
       this.onSignal(event.getSender(), event.getContent());
     });

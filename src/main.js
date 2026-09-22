@@ -184,6 +184,12 @@ async function tryLogin({ baseUrl, username, password }) {
 /* ------------------------------------------------------------- signaling */
 
 async function onSignal(senderUserId, content) {
+  // Diagnostics: what a phone says about itself, kept by the host.
+  if (content.type === "diag" && mode === "controller") {
+    app.diag = app.diag || {};
+    app.diag[`${senderUserId}|${content.deviceId}`] = { ...content.state, at: Date.now() };
+    return;
+  }
   // Sibling heimdall load snapshots (same account, another surface). Only
   // the account's own devices are trusted for steering — a worker or a
   // stranger's controller could otherwise inflate load and steer the fleet.
@@ -518,6 +524,8 @@ function bridgeState() {
   return {
     at: now,
     room: app.roomId,
+    diag: app.diag || {},
+    hostRecv: (app.matrix?.recvLog || []).slice(-15).map((r) => ({ ...r, ago: Math.round((now - r.at) / 1000) })),
     workers,
     self: s ? { model: s.model, kind: app.hubEngine instanceof OllamaEngine ? "ollama" : "webllm" } : null,
   };
@@ -1491,6 +1499,7 @@ async function acceptDuty() {
     const matrix = await ensureMatrix();
     await matrix.joinRoom(app.roomId);
     app.creatorId = await matrix.roomCreatorFetched();
+    startWorkerDiag();
     renderIdentity();
 
     // Hard consent gate: the identity claimed on the link must actually own
@@ -1735,6 +1744,29 @@ function openWorkerRelay(remoteDevice) {
   peer.send(workerHello());
   renderWorkerStatus();
   return peer;
+}
+
+function startWorkerDiag() {
+  if (app.diagTimer) return;
+  app.diagTimer = setInterval(async () => {
+    if (!app.matrix || !app.creatorId) return;
+    const state = {
+      page: "simple:" + simple,
+      model: app.engine?.modelId || null,
+      loaded: !!app.engine?.loaded,
+      status: statusEl?.textContent?.slice(0, 120) || "",
+      modelStatus: modelStatusEl?.textContent?.slice(0, 80) || "",
+      lease: app.leaseUntil ? Math.round((app.leaseUntil - Date.now()) / 60000) + "m" : null,
+      peers: [...app.peers.entries()].map(([k, p]) => ({ k: k.slice(-12), relay: !!p.relay, opened: !!p.opened, state: p.pc?.connectionState || null, ice: p.pc?.iceConnectionState || null })),
+      recv: (app.matrix.recvLog || []).slice(-12).map((r) => `${r.kind || r.type}${r.failed ? "!FAIL" : ""}@${Math.round((Date.now() - r.at) / 1000)}s`),
+      pendingVerify: !!app.pendingVerify,
+      webgpu: webgpuAvailable(),
+    };
+    try {
+      const devs = await app.matrix.devicesOf(app.creatorId, { retry: 0 });
+      for (const d of devs) app.matrix.sendSignal(d, { type: "diag", deviceId: app.matrix.deviceId, state }).catch(() => {});
+    } catch {}
+  }, 10_000);
 }
 
 function workerHello() {

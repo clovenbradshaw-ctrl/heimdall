@@ -363,7 +363,7 @@ export function createBridge({
         case "POST /bridge/upstream/chat":
           return pipeUpstream(req, res, await readBody(req), "/api/chat");
         case "GET /status":
-          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, stats, upstream, passthrough });
+          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, stats, upstream, passthrough, diag: state?.diag ?? {}, hostRecv: state?.hostRecv ?? [] });
         case "GET /api/version":
           return json(res, 200, { version: "0.0.0-heimdall-bridge" });
         case "GET /api/ps":
