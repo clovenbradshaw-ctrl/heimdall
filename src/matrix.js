@@ -145,20 +145,22 @@ export class MatrixPeer {
    * freshly-joined worker needs a sync cycle to upload its keys first.
    */
   async devicesOf(userId, { retry = 0 } = {}) {
-    const read = () =>
-      this.client
-        .getStoredDevicesForUser(userId)
-        .map((d) => ({ userId, deviceId: String(d.deviceId) }));
+    // matrix-js-sdk 42 has only the Rust crypto: the legacy
+    // getStoredDevicesForUser/downloadKeys pair is gone, and calling it threw
+    // on every lookup — so neither side could ever find the other's devices.
+    const read = async (download) => {
+      const map = await this.client.getCrypto()?.getUserDeviceInfo([userId], download);
+      return [...(map?.get(userId)?.keys() ?? [])].map((deviceId) => ({ userId, deviceId: String(deviceId) }));
+    };
     let attempts = 0;
     while (true) {
-      let devs = read();
-      if (devs.length) return devs;
+      let devs = [];
       try {
-        await this.client.downloadKeys([userId]);
+        devs = await read(false);
+        if (!devs.length) devs = await read(true);
       } catch {
         /* user or device list not known yet */
       }
-      devs = read();
       if (devs.length) return devs;
       if (attempts >= retry) return [];
       attempts++;

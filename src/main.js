@@ -460,8 +460,8 @@ async function startBridge() {
   if (ownBoxEl) ownBoxEl.checked = true; // it's your computer: devices you pair here are yours
   renderBridge();
   if (app.roomId) refreshShareBox();
-  // Running `heimdall up` is the ask for a fleet — make one if there is none.
-  if (!app.session?.roomId) await createRoom();
+  // No fleet yet: the Start button on the page makes one (it creates a
+  // Matrix account, so it waits for a person's click).
   // Lend this computer's Ollama back, so a phone can borrow its GPU.
   if (info.lendModel && !app.lendDevice) await lendOllama(info.lendModel);
 }
@@ -547,7 +547,7 @@ function renderBridge() {
           : "Waiting for a phone";
   bridgeStatusEl.replaceChildren(
     el("div", { class: "bridge-line" + (busy.length ? " running" : "") }, [el("span", { class: "act-dot" }), el("span", { text: line })]),
-    app.bridgeJobs ? el("div", { class: "muted small", text: `${app.bridgeJobs} request${app.bridgeJobs > 1 ? "s" : ""} from this computer so far` }) : null,
+    ...(app.bridgeJobs ? [el("div", { class: "muted small", text: `${app.bridgeJobs} request${app.bridgeJobs > 1 ? "s" : ""} from this computer so far` })] : []),
   );
 }
 
@@ -2078,26 +2078,33 @@ function controllerView() {
   // Served by `heimdall up` (or embedded in the Fold): one thing to do —
   // scan. Everything else folds under "more".
   if (app.bridgeInfo) {
-    return el("div", { class: "view simple" + (embed ? " embed" : "") }, [
+    let startFleetEl;
+    const view = el("div", { class: "view simple" + (embed ? " embed" : "") }, [
       el("div", { class: "card center" }, [
-        el("h2", { text: "Scan with your phone" }),
+        el("h2", { text: app.session?.roomId ? "Scan with your phone" : "Share this computer's compute" }),
+        app.session?.roomId ? null : (startFleetEl = el("button", { class: "primary big", text: "Start", onclick: async () => {
+          startFleetEl.disabled = true;
+          startFleetEl.textContent = "Starting…";
+          await createRoom();
+          startFleetEl.hidden = true;
+          view.querySelector("h2").textContent = "Scan with your phone";
+        } })),
         qrEl,
         bridgeStatusEl,
-      ]),
+      ].filter(Boolean)),
       fleetCardEl,
       el("details", { class: "card more" }, [
         el("summary", { class: "muted", text: "more" }),
         el("div", { class: "row" }, [createBtn, freshBtn]),
         shareRow,
         inviteExpiryEl,
-        pendingEl,
-        codeRow,
-        ownRow,
         el("p", { class: "muted small", text: "Programs on this computer reach the phone at " + location.origin + " (it speaks Ollama). For eoreader7:" }),
         el("div", { class: "row" }, [el("code", { text: hostsLine }), copyBtn("copy", () => hostsLine)]),
         lendCard,
+        loginCard(),
       ]),
     ]);
+    return view;
   }
 
   if (embed) {
@@ -2274,17 +2281,15 @@ function simpleWorkerView() {
 
   const view = el("div", { class: "view simple" }, [
     el("div", { class: "card" }, [
-      el("h2", { text: `Lend this phone to ${who}` }),
+      el("h2", { text: "Lend this phone" }),
       webgpuAvailable() ? null : el("div", { class: "alert warn", text: "This browser can't run models (no WebGPU). Use Safari on iOS 26+ or Chrome on Android." }),
       modelStatusEl,
       progressEl,
       el("div", { style: "height:8px" }),
       acceptBtnEl,
       statusEl,
-      el("details", { class: "small" }, [el("summary", { class: "muted", text: "model" }), modelSel]),
     ].filter(Boolean)),
     el("div", { class: "card", id: "worker-status" }, [activityEl]),
-    el("div", { class: "card" }, [borrowEl, el("div", { class: "row" }, [borrowBtnEl, borrowHintEl]), workerConsoleEl]),
   ]);
   renderActivity();
   return view;
