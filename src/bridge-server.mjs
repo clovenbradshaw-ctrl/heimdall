@@ -89,6 +89,14 @@ export function createBridge({
   const jobs = new Map(); // id -> { onMsg }
   const stats = { fleet: 0, passthrough: 0, fellThrough: 0 };
   const selfOrigins = new Set([`http://localhost:${port}`, `http://127.0.0.1:${port}`]);
+  // Any page on THIS box, any port, may use the bridge from a browser (a
+  // caller like the-fold's app.js is served from its own port and needs a
+  // real CORS allowance to get past the browser's own preflight) -- mirrors
+  // eoreader7/proxy.mjs's identical LOOPBACK_PAGE_ORIGIN reflection for the
+  // same reason stated there: an arbitrary website must never be able to
+  // drive local inference through the user's browser, so only loopback
+  // origins are ever reflected back, never a blanket "*".
+  const LOOPBACK_PAGE_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 
   // Tab survival: noTabsSince is when the count last dropped to (or started
   // at) zero — null while at least one SSE tab is connected. A boot with no
@@ -388,10 +396,25 @@ export function createBridge({
   /* ---------------------------------------------------------- router */
 
   const server = http.createServer(async (req, res) => {
-    // Only this page and origin-less local clients (eoreader7, curl) may
-    // talk to the bridge — the same rule Ollama applies to browsers.
+    // Only this page, any other loopback page (the-fold, eoreader7's own
+    // /ui, curl), and origin-less local clients may talk to the bridge —
+    // the same loopback-only CORS reflection eoreader7/proxy.mjs uses for
+    // its own channel, never a blanket "*".
     const origin = req.headers.origin;
-    if (origin && !selfOrigins.has(origin)) return json(res, 403, { error: `origin ${origin} not allowed` });
+    const pageOrigin = typeof origin === "string" && (selfOrigins.has(origin) || LOOPBACK_PAGE_ORIGIN.test(origin)) ? origin : null;
+    if (origin && !pageOrigin) return json(res, 403, { error: `origin ${origin} not allowed` });
+    if (pageOrigin) {
+      res.setHeader("access-control-allow-origin", pageOrigin);
+      res.setHeader("vary", "Origin");
+    }
+    if (req.method === "OPTIONS") {
+      if (pageOrigin) {
+        res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+        res.setHeader("access-control-allow-headers", String(req.headers["access-control-request-headers"] || "content-type"));
+      }
+      res.writeHead(204);
+      return res.end();
+    }
     const u = new URL(req.url, "http://x");
     const route = `${req.method} ${u.pathname}`;
     try {
