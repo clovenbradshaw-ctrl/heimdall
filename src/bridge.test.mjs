@@ -35,7 +35,7 @@ before(async () => {
 
   const dist = mkdtempSync(join(tmpdir(), "heimdall-dist-"));
   writeFileSync(join(dist, "index.html"), "<!doctype html><title>heimdall</title>");
-  bridge = createBridge({ port: 0, dist, upstream: upstreamUrl, lendModel: "gemma2:2b" });
+  bridge = createBridge({ port: 0, dist, upstream: upstreamUrl, lendModel: "gemma2:2b", autoOpen: false });
   const addr = await bridge.listen();
   base = `http://127.0.0.1:${addr.port}`;
 
@@ -117,7 +117,34 @@ test("/api/ps lists only what a ready phone holds, without context_length", asyn
   const g = ps.models.find((m) => m.name === "gemma2:2b");
   assert.equal(g.context_length, undefined);
   assert.equal(g.heimdall.context_window, 4096);
+  assert.equal(g.heimdall.queueDepth, 0, "no queueDepth reported yet reads as 0, not missing");
   assert.ok(Date.parse(g.expires_at) > Date.now());
+});
+
+test("a worker's reported queueDepth is honest backpressure, not an optimistic ready", async () => {
+  await post("/bridge/state", {
+    at: Date.now(),
+    room: "!r:hs",
+    workers: [
+      { key: "@p:hs|PHONE", name: "iPhone", model: "gemma-2-2b-it-q4f16_1-MLC", ctx: 4096, standing: "ready", ready: true, queueDepth: 3 },
+      { key: "@q:hs|STALE", name: "old", model: "Qwen3-4B-q4f16_1-MLC", standing: "stale", ready: false },
+    ],
+  });
+  const ps = await (await fetch(base + "/api/ps")).json();
+  const g = ps.models.find((m) => m.name === "gemma2:2b");
+  assert.equal(g.heimdall.queueDepth, 3, "the phone's own backlog, not zero, while it is mid-generation");
+  const status = await (await fetch(base + "/status")).json();
+  assert.equal(status.workers.find((w) => w.key === "@p:hs|PHONE").queueDepth, 3);
+  assert.equal(status.pending, 0, "nothing sent through THIS bridge is in flight");
+  // Restore the fixture the rest of the suite expects.
+  await post("/bridge/state", {
+    at: Date.now(),
+    room: "!r:hs",
+    workers: [
+      { key: "@p:hs|PHONE", name: "iPhone", model: "gemma-2-2b-it-q4f16_1-MLC", ctx: 4096, standing: "ready", ready: true },
+      { key: "@q:hs|STALE", name: "old", model: "Qwen3-4B-q4f16_1-MLC", standing: "stale", ready: false },
+    ],
+  });
 });
 
 test("/api/tags = fleet models plus upstream's", async () => {

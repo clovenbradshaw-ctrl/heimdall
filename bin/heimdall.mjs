@@ -4,7 +4,7 @@
 //   heimdall invite [--name "Your Name"] [--room !id:hs] [--new]
 //   heimdall login --user @me:hs --password …
 //   heimdall reset
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ const SITE = process.env.HEIMDALL_SITE || "https://clovenbradshaw-ctrl.github.io
 const HS = "https://hyphae.social";
 const STATE_DIR = join(homedir(), ".heimdall");
 const STATE = join(STATE_DIR, "state.json");
+const PIDFILE = join(STATE_DIR, "bridge.pid");
 
 const args = process.argv.slice(2);
 const cmd = args[0] || "invite";
@@ -99,8 +100,48 @@ if (cmd === "login") {
   console.log("  heimdall reset");
   console.log("");
   console.log("env: HEIMDALL_SITE overrides the link base, e.g. for local dev.");
+  console.log("     HEIMDALL_NO_OPEN=1 is --no-open for a headless/server-only start (no startup open, no auto-reopen).");
 }
 /* ------------------------------------------------------------------ up */
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM"; // exists, just isn't ours to signal — still alive
+  }
+}
+
+// A second `heimdall up` on the SAME port hits EADDRINUSE below and dies
+// loudly — but a second one started with a different --port binds fine and
+// becomes a second, independently-reachable bridge nobody chose to run: the
+// "two servers silently splitting traffic" bug class behind this codebase's
+// Ollama-predecessor reload-storm incident. This lock is one per machine,
+// not keyed by port, so that case is refused too, before either bridge
+// finishes coming up.
+function acquireLock(port) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  try {
+    const prev = JSON.parse(readFileSync(PIDFILE, "utf8"));
+    if (pidAlive(prev.pid)) {
+      console.error(`heimdall is already up — pid ${prev.pid}, port ${prev.port ?? "?"} (started ${prev.startedAt ?? "unknown time"}).`);
+      console.error(`stop it first, or if that's stale: rm ${PIDFILE}`);
+      process.exit(1);
+    }
+  } catch (e) {
+    if (e.code !== "ENOENT" && !(e instanceof SyntaxError)) throw e; // anything but "no lock yet" is real
+  }
+  writeFileSync(PIDFILE, JSON.stringify({ pid: process.pid, port, startedAt: new Date().toISOString() }, null, 2));
+}
+
+function releaseLock() {
+  try {
+    const cur = JSON.parse(readFileSync(PIDFILE, "utf8"));
+    if (cur.pid === process.pid) rmSync(PIDFILE, { force: true });
+  } catch {}
+}
 
 async function up() {
   const { createBridge } = await import("../src/bridge-server.mjs");
@@ -115,8 +156,12 @@ async function up() {
     }
   }
   const port = Number(flag("--port", process.env.HEIMDALL_PORT || 8790));
+  acquireLock(port);
   const upstream = (process.env.OLLAMA_HOST ? (process.env.OLLAMA_HOST.startsWith("http") ? process.env.OLLAMA_HOST : "http://" + process.env.OLLAMA_HOST) : "http://127.0.0.1:11434").replace(/\/+$/, "");
   const passthrough = !has("--no-passthrough");
+  // Headless/server start: skip both the startup open below AND the
+  // bridge's own later auto-reopen when the tab drops.
+  const noOpen = has("--no-open") || process.env.HEIMDALL_NO_OPEN === "1";
 
   // What this computer lends back to the phones: the caller's default model
   // if Ollama has it, else the first chat model installed. --lend none = don't.
@@ -135,12 +180,14 @@ async function up() {
     upstream,
     passthrough,
     lendModel,
+    autoOpen: !noOpen,
     site: process.env.HEIMDALL_SITE || SITE,
     log: (line) => console.log(new Date().toISOString().slice(11, 19) + "  " + line),
   });
   try {
     await bridge.listen();
   } catch (e) {
+    releaseLock();
     if (e.code === "EADDRINUSE") {
       console.error(`port ${port} is taken — is heimdall already up? (open http://localhost:${port}) or pass --port`);
       process.exit(1);
@@ -160,11 +207,11 @@ async function up() {
   console.log("");
   console.log("  keep the page open — it is the fleet's controller. ctrl-c to stop.");
   console.log("");
-  if (!has("--no-open")) {
+  if (!noOpen) {
     const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
     try { spawn(opener, [url], { stdio: "ignore", detached: true, shell: process.platform === "win32" }).unref(); } catch {}
   }
-  const stop = () => bridge.close().then(() => process.exit(0));
+  const stop = () => bridge.close().then(() => { releaseLock(); process.exit(0); });
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 }

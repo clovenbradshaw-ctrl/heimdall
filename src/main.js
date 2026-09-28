@@ -608,12 +608,16 @@ function bridgeState() {
     // Routable only once the phone has tapped Start (a live lease) and says
     // which weights are actually loaded.
     ready: isEligible(rec, now) && !!modelOf(rec) && (rec.hello?.leaseUntil ?? 0) > now,
+    // The same worker-reported backlog route.js already ranks givers by
+    // (rec.queueDepth, from the phone's own WorkerEngine.pending) — the
+    // bridge needs it too, to answer callers honestly instead of "ready".
+    queueDepth: rec.queueDepth ?? 0,
   }));
   const s = selfGiver();
   // This tab lending WebLLM is one more giver the bridge may use; a lent
   // Ollama is not (the bridge reaches Ollama directly).
   if (s && !(app.hubEngine instanceof OllamaEngine)) {
-    workers.push({ key: "self", name: "this computer (browser)", model: s.model, ctx: app.hubEngine?.contextWindow ?? null, standing: "ready", ready: true });
+    workers.push({ key: "self", name: "this computer (browser)", model: s.model, ctx: app.hubEngine?.contextWindow ?? null, standing: "ready", queueDepth: app.hubEngine?.pending ?? 0, ready: true });
   }
   return {
     at: now,

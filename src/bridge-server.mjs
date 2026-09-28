@@ -22,12 +22,21 @@
 // picker sees the phone as hot only for the models it truly has. The phone's
 // context window is reported as `heimdall.context_window`, not `context_length`:
 // eoreader7's same-shape rule exists to stop Ollama reloads, which cannot
-// happen on a phone; overflow is handled by the fall-through above.
+// happen on a phone; overflow is handled by the fall-through above. Each
+// model's `heimdall.queueDepth` (and /status's `pending`) is real
+// backpressure, not an optimistic zero: WorkerEngine has no parallelism, so
+// a caller ranking hosts by expected wait needs to see a busy fleet as busy.
+//
+// If zero controller tabs are connected for more than a few seconds, the
+// bridge tries to open one itself (autoOpen, on by default) — the same
+// reasoning as the pidfile lock in bin/heimdall.mjs: a fleet nobody can
+// reach is worse than one that tries to fix itself.
 
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { exec } from "node:child_process";
 import { answers, normalizeTag, ollamaTagOf } from "./models.js";
 
 // The tab posts its state every 5 s — but a hidden tab's timers are throttled
@@ -41,6 +50,15 @@ const TAB_FRESH_MS = 5 * 60_000;
 const PING_MS = 10_000;
 const FIRST_TOKEN_MS = 180_000; // a phone's cold first token (model already loaded) — then fall through
 const IDLE_MS = 120_000; // silence mid-stream this long ends the job
+
+// Nobody home: zero SSE tabs connected (not merely stale — actually none).
+// Give a person, or `heimdall up`'s own opener, this long before the bridge
+// tries for itself; then don't retry more than once per cooldown, so a tab
+// someone closed on purpose doesn't get reopened out from under them every
+// few seconds.
+const NO_TAB_GRACE_MS = 8_000;
+const NO_TAB_REOPEN_COOLDOWN_MS = 2 * 60_000;
+const NO_TAB_CHECK_MS = 5_000;
 
 const TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -62,6 +80,7 @@ export function createBridge({
   passthrough = true,
   site = "https://clovenbradshaw-ctrl.github.io/heimdall/",
   lendModel = null,
+  autoOpen = true, // try to open a controller tab ourselves when none is connected
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
@@ -70,6 +89,31 @@ export function createBridge({
   const jobs = new Map(); // id -> { onMsg }
   const stats = { fleet: 0, passthrough: 0, fellThrough: 0 };
   const selfOrigins = new Set([`http://localhost:${port}`, `http://127.0.0.1:${port}`]);
+
+  // Tab survival: noTabsSince is when the count last dropped to (or started
+  // at) zero — null while at least one SSE tab is connected. A boot with no
+  // tab yet starts the grace clock immediately, the same as a later drop.
+  let noTabsSince = Date.now();
+  let lastAutoOpenAt = 0;
+
+  function maybeAutoOpen() {
+    if (!autoOpen || tabs.size > 0 || noTabsSince == null) return;
+    const now = Date.now();
+    if (now - noTabsSince < NO_TAB_GRACE_MS) return;
+    if (now - lastAutoOpenAt < NO_TAB_REOPEN_COOLDOWN_MS) return;
+    lastAutoOpenAt = now;
+    const url = `http://localhost:${port}/`;
+    // Same OS-open pattern as eoreader7's cli/browser.mjs, so a headless
+    // `open`/`xdg-open` failure here behaves the same way it does there.
+    const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    log(`no controller tab for ${Math.round((now - noTabsSince) / 1000)}s — opening one (${cmd} ${url})`);
+    try {
+      exec(`${cmd} ${url}`, (err) => { if (err) log(`could not open a tab automatically: ${err.message}`); });
+    } catch (e) {
+      log(`could not open a tab automatically: ${e.message}`);
+    }
+  }
+  const noTabTimer = setInterval(maybeAutoOpen, NO_TAB_CHECK_MS);
 
   const tabAlive = () => tabs.size > 0 && Date.now() - stateAt < TAB_FRESH_MS;
   const readyWorkers = () => (tabAlive() ? (state?.workers ?? []).filter((w) => w.ready && w.model) : []);
@@ -190,9 +234,14 @@ export function createBridge({
     const seen = new Map();
     for (const w of readyWorkers()) {
       const tag = ollamaTagOf(w.model);
+      // The worker's own reported backlog (WorkerEngine.pending, carried
+      // through bridgeState()) — 0 when the tab hasn't said otherwise, never
+      // guessed. A caller ranking by expected wait needs this to be honest,
+      // not an optimistic "ready" while a phone is mid-generation.
+      const q = Number.isFinite(w.queueDepth) ? w.queueDepth : 0;
       for (const name of [tag, w.model].filter(Boolean)) {
         const cur = seen.get(name);
-        if (cur) { cur.heimdall.workers++; continue; }
+        if (cur) { cur.heimdall.workers++; cur.heimdall.queueDepth += q; continue; }
         seen.set(name, {
           name,
           model: name,
@@ -200,7 +249,7 @@ export function createBridge({
           size: 0,
           digest: "",
           details: tagDetails(w.model),
-          heimdall: { webllm: w.model, workers: 1, context_window: w.ctx ?? null },
+          heimdall: { webllm: w.model, workers: 1, context_window: w.ctx ?? null, queueDepth: q },
         });
       }
     }
@@ -353,8 +402,13 @@ export function createBridge({
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
           res.write(": heimdall bridge\n\n");
           tabs.add(res);
+          noTabsSince = null;
           const ka = setInterval(() => res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`), PING_MS);
-          req.on("close", () => { clearInterval(ka); tabs.delete(res); });
+          req.on("close", () => {
+            clearInterval(ka);
+            tabs.delete(res);
+            if (tabs.size === 0) noTabsSince = Date.now();
+          });
           log(`controller tab connected (${tabs.size} open)`);
           return;
         }
@@ -373,7 +427,10 @@ export function createBridge({
         case "POST /bridge/upstream/chat":
           return pipeUpstream(req, res, await readBody(req), "/api/chat");
         case "GET /status":
-          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, stats, upstream, passthrough, diag: state?.diag ?? {}, hostRecv: state?.hostRecv ?? [] });
+          // `pending` is this bridge's own in-flight fleet jobs — measured
+          // here, not reported by the tab, so it's never stale between the
+          // tab's 5s state posts.
+          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, pending: jobs.size, stats, upstream, passthrough, diag: state?.diag ?? {}, hostRecv: state?.hostRecv ?? [] });
         case "GET /api/version":
           return json(res, 200, { version: "0.0.0-heimdall-bridge" });
         case "GET /api/ps":
@@ -409,7 +466,7 @@ export function createBridge({
   return {
     server,
     listen: () => new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, () => resolve(server.address())); }),
-    close: () => new Promise((r) => { for (const t of tabs) t.end(); server.close(() => r()); }),
+    close: () => new Promise((r) => { clearInterval(noTabTimer); for (const t of tabs) t.end(); server.close(() => r()); }),
     stats,
     fleetServes,
     normalizeTag,
