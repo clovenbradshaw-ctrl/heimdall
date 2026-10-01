@@ -10,6 +10,33 @@ export const SIGNAL_TYPE = "org.heimdall.signal";
 
 const ENCRYPTION_STATE = { type: "m.room.encryption", state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } };
 
+// A short invite code is a room's local alias (`#<code>:<server>`): the code
+// IS the thing a person types on the worker's computer, so the alphabet
+// drops every look-alike pair (0/O, 1/I/l) and stays lowercase.
+export const SHORT_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789";
+export const SHORT_LENGTH = 5;
+
+export function shortCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(SHORT_LENGTH));
+  return [...bytes].map((b) => SHORT_ALPHABET[b % SHORT_ALPHABET.length]).join("");
+}
+
+export function hostOf(baseUrl) {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return "";
+  }
+}
+
+/** True when a createRoom/createAlias failure means the alias is taken — the
+ *  one error a mint retries with a fresh code. */
+export function aliasTaken(e) {
+  if (e?.errcode === "M_IN_USE") return true;
+  const m = String(e?.message || "").toLowerCase();
+  return /in use|taken|already/.test(m);
+}
+
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -86,6 +113,29 @@ export class MatrixPeer {
   }
 
   async createFleetRoom() {
+    // The room is born with a short local alias (`#<code>:<server>`): the
+    // invite link is then just `?r=<code>`, short enough to type by hand on
+    // a worker's computer. A taken alias is the one expected collision — try
+    // a fresh code; the last fallback creates the room with no alias and the
+    // full link is still minted.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = shortCode();
+      try {
+        const res = await this.client.createRoom({
+          name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
+          preset: "public_chat",
+          visibility: "private",
+          room_alias_name: code,
+          initial_state: [ENCRYPTION_STATE],
+        });
+        this.roomId = res.room_id;
+        this.alias = code;
+        return this.roomId;
+      } catch (e) {
+        if (aliasTaken(e)) continue;
+        throw e;
+      }
+    }
     const res = await this.client.createRoom({
       name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
       preset: "public_chat",
@@ -93,7 +143,32 @@ export class MatrixPeer {
       initial_state: [ENCRYPTION_STATE],
     });
     this.roomId = res.room_id;
+    this.alias = null;
     return this.roomId;
+  }
+
+  /** A short invite code is a room's local alias. Resolve `#<code>:<server>`
+   *  to the room id, exactly as the matrix-js-sdk directory lookup does. */
+  async resolveAlias(code) {
+    const alias = `#${code}:${hostOf(this.baseUrl)}`;
+    const roomId = await this.client.getRoomIdForAlias(alias);
+    this.roomId = roomId;
+    return roomId;
+  }
+
+  /** Recover the room's short alias after a rejoin, so the invite link keeps
+   *  being typable. A room with no short alias reads null. */
+  async restoreAlias() {
+    try {
+      const { aliases } = await this.client.getLocalAliases(this.roomId);
+      const code = (aliases || [])
+        .map((a) => a.split(":")[0].slice(1))
+        .find((c) => /^[a-z0-9]{3,8}$/.test(c));
+      this.alias = code || null;
+    } catch {
+      this.alias = null;
+    }
+    return this.alias;
   }
 
   /** The room carries no messages, but it must be ENCRYPTED: the crypto only
@@ -354,11 +429,30 @@ export function shareUrl(roomId, baseUrl, site) {
   return `${here}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}`;
 }
 
-export function parseShareUrl() {
+export function parseShareUrl(defaultHs) {
   const params = new URLSearchParams(location.search);
   const room = params.get("room");
   const hs = params.get("hs");
-  if (!room || !hs) return null;
+  // A short invite: just `?r=<code>` (optionally `&hs=` when the fleet is not
+  // on the default server). The code is the room's local alias, resolved
+  // before the worker joins; host/name/exp ride nothing here, so identity is
+  // verified against the room's creator and pairing needs the 6-digit code.
+  if (!room) {
+    const code = String(params.get("r") || "").toLowerCase();
+    if (/^[a-z0-9]{3,8}$/.test(code)) {
+      return {
+        shortCode: code,
+        baseUrl: params.get("hs") || defaultHs || null,
+        host: "",
+        name: "",
+        exp: 0,
+        codeHash: "",
+        key: "",
+      };
+    }
+    return null;
+  }
+  if (!hs) return null;
   return {
     roomId: room,
     baseUrl: hs,

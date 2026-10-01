@@ -1,11 +1,12 @@
 import { createClient } from "matrix-js-sdk";
-import { registerAuto, randomUsername, sha256Hex, getAccountData, setAccountData } from "./matrix.js";
+import { registerAuto, randomUsername, sha256Hex, getAccountData, setAccountData, shortCode, hostOf, aliasTaken } from "./matrix.js";
 import { revokeEntry, withRevoked, withoutRevoked } from "./liveness.js";
 
 export const CODE_TYPE = "org.heimdall.codes";
 export const KEYS_TYPE = "org.heimdall.keys";
 export const REVOKED_TYPE = "org.heimdall.revoked";
 export const INVITE_TTL = 7 * 24 * 3600 * 1000;
+export const DEFAULT_HS = "https://hyphae.social";
 
 export function makeSecretCode() {
   const bytes = crypto.getRandomValues(new Uint32Array(1))[0];
@@ -88,6 +89,16 @@ export function pairingPayload(roomId, userId, deviceId, codeHash) {
 
 export function buildInviteUrl({ site, roomId, baseUrl, host, name, exp }) {
   return `${site}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}&host=${encodeURIComponent(host)}&name=${encodeURIComponent(name)}&exp=${exp}`;
+}
+
+/** The short invite link: the room's alias code, nothing else. `?r=<code>`
+ *  is the whole URL (and the 404 page lets `/<code>` be typed instead); the
+ *  homeserver is only named when it is not the default. */
+export function buildShortUrl({ site, code, baseUrl, defaultHs = DEFAULT_HS }) {
+  let url = `${String(site).replace(/\?.*$/, "")}?r=${encodeURIComponent(code)}`;
+  const host = hostOf(baseUrl);
+  if (host && host !== hostOf(defaultHs)) url += `&hs=${encodeURIComponent(baseUrl)}`;
+  return url;
 }
 
 /** Register a controller account if none is provided. */
@@ -195,18 +206,51 @@ export async function createInvite({ baseUrl, creds, roomId, displayName, site }
     userId: creds.userId,
     deviceId: creds.deviceId,
   });
+  let code = null;
   if (!roomId) {
-    const room = await client.createRoom({
-      name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
-      preset: "public_chat",
-      visibility: "private",
-    });
-    roomId = room.room_id;
+    // Mint the room with a short local alias so the invite can be typed by
+    // hand (`?r=<code>`). A taken alias is the one expected collision.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = shortCode();
+      try {
+        const room = await client.createRoom({
+          name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
+          preset: "public_chat",
+          visibility: "private",
+          room_alias_name: candidate,
+        });
+        roomId = room.room_id;
+        code = candidate;
+        break;
+      } catch (e) {
+        if (aliasTaken(e)) continue;
+        throw e;
+      }
+    }
+    if (!roomId) {
+      const room = await client.createRoom({
+        name: `heimdall-${Math.random().toString(36).slice(2, 7)}`,
+        preset: "public_chat",
+        visibility: "private",
+      });
+      roomId = room.room_id;
+    }
+  } else {
+    // Reusing an existing fleet: recover its short alias so the invite stays
+    // typable. A room with no short alias reads null (full link only).
+    try {
+      const { aliases } = await client.getLocalAliases(roomId);
+      code = (aliases || []).map((a) => a.split(":")[0].slice(1)).find((c) => /^[a-z0-9]{3,8}$/.test(c)) || null;
+    } catch {
+      code = null;
+    }
   }
   const exp = Date.now() + INVITE_TTL;
   const name = displayName || creds.userId;
   return {
     url: buildInviteUrl({ site, roomId, baseUrl, host: creds.userId, name, exp }),
+    shortUrl: code ? buildShortUrl({ site, code, baseUrl }) : null,
+    code,
     exp,
     roomId,
     creds,

@@ -146,6 +146,18 @@ proof travels with the worker, not the surface.
   script can import `createInvite` (browser or Node) to mint an invite and
   push the code into the shared registry.
 
+**Short links, for a computer you have to type on.** Every fleet room is born
+with a short local alias, so the same invite also exists as a link you can
+type by hand: `https://clovenbradshaw-ctrl.github.io/heimdall/?r=h7q2x` (or
+`.../heimdall/h7q2x` — the 404 page rewrites the path). The code *is* the
+room's alias; the page resolves it and then runs the normal worker flow:
+identity is still verified against the room's creator, and pairing still
+needs the worker's read-aloud 6-digit code (the short link carries no
+auto-pairing secret and no expiry — the host's live confirmation enforces
+both). The minting surfaces print the short link alongside the full one:
+the site's share box, `heimdall invite` (`SHORT  …`), the fold, and the
+Holodeck's Settings → Compute workers.
+
 For all surfaces to be one identity: sign in with the **same Matrix account**
 everywhere (`heimdall login --user …` on the CLI, "Sign in with my own account"
 on the site, claim the account to fix a password). Keep the controller site
@@ -164,7 +176,10 @@ git push -u origin main
 ```
 
 Then: repo **Settings → Pages → Source: GitHub Actions**. Done — the share
-links will be `https://<you>.github.io/<repo>/?room=...&hs=...`.
+links will be `https://<you>.github.io/<repo>/?room=...&hs=...`, and the
+typable short form `https://<you>.github.io/<repo>/?r=<code>` (or
+`/<repo>/<code>`) works because a room's alias code rides in the `?r=`
+parameter.
 
 Local dev:
 

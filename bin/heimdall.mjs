@@ -74,9 +74,12 @@ if (cmd === "login") {
   const roomId = flag("--room", has("--new") ? "" : state.roomId);
   const name = flag("--name", creds.userId);
   const { createInvite } = await inviteLib();
-  const { url, exp, roomId: rid } = await createInvite({ baseUrl, creds, roomId, displayName: name, site: SITE });
+  const { url, shortUrl, exp, roomId: rid } = await createInvite({ baseUrl, creds, roomId, displayName: name, site: SITE });
   save({ creds, roomId: rid });
   console.log("INVITE   " + url);
+  if (shortUrl) {
+    console.log("SHORT    " + shortUrl + "   <-- type this by hand on a worker's computer");
+  }
   console.log("ROOM     " + rid);
   console.log("HOST     " + creds.userId);
   console.log("EXPIRES  " + new Date(exp).toISOString());

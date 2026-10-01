@@ -37,6 +37,7 @@ import {
   revokeDevice,
   unrevokeDevice,
   ownPairedDevices,
+  buildShortUrl,
 } from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
@@ -190,6 +191,19 @@ async function ensureMatrix() {
   });
   app.matrix = matrix;
   await matrix.start();
+  // A short invite (`?r=<code>`) names no room: resolve the code — the room's
+  // local alias — to the fleet room before anything else. host/name/exp ride
+  // nothing in the short link, so identity is checked against the room's
+  // creator and pairing needs the read-aloud 6-digit code.
+  if (share?.shortCode && !app.roomId) {
+    try {
+      app.roomId = await matrix.resolveAlias(share.shortCode);
+      saveSession({ roomId: app.roomId });
+    } catch (e) {
+      toast(`no fleet found for "${share.shortCode}" — check the link or ask for a fresh one`);
+      throw e;
+    }
+  }
   return matrix;
 }
 
@@ -500,16 +514,34 @@ async function renewInvite() {
 
 async function refreshShareBox() {
   if (!shareBoxEl || !app.roomId) return;
-  shareBoxEl.value = await buildInviteUrl();
+  const full = await buildInviteUrl();
+  const short = shortShareUrl();
+  // The box carries the SHORT link — the one a person can actually type on a
+  // worker's computer by hand. The QR keeps the full link so a phone still
+  // scans into an auto-pairing invite (its `k` secret, no code to read out).
+  shareBoxEl.value = short || full;
   shareBoxEl.disabled = false;
+  if (fullLinkBtnEl) fullLinkBtnEl.hidden = !short;
   if (qrEl) {
     const qr = qrcode(0, "M");
-    qr.addData(shareBoxEl.value);
+    qr.addData(full);
     qr.make();
     qrEl.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 3, scalable: true });
     qrEl.hidden = false;
   }
   inviteExpiryEl.textContent = `link expires ${countdownText(app.invite.exp)} — renew to keep it alive`;
+}
+
+/** The short invite link (`?r=<code>`), when this fleet room has an alias. */
+function shortShareUrl() {
+  if (!app.matrix?.alias) return null;
+  const local = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  const site = local ? app.bridgeInfo?.site || PUBLIC_SITE : undefined;
+  return buildShortUrl({
+    site: site || `${location.origin}${location.pathname}`,
+    code: app.matrix.alias,
+    baseUrl: app.hs,
+  });
 }
 
 async function createRoom() {
@@ -536,6 +568,7 @@ async function rejoin() {
     await matrix.joinRoom(app.session.roomId);
     app.roomId = app.session.roomId;
     await matrix.ensureEncrypted();
+    await matrix.restoreAlias();
     fleetCardEl.hidden = false;
     promptCardEl.hidden = false;
     refreshShareBox();
@@ -2196,7 +2229,7 @@ async function keepAwake() {
 /* ------------------------------------------------------------------- view */
 
 let qrEl, bridgeCardEl, bridgeStatusEl, ownBoxEl;
-let shareBoxEl, inviteExpiryEl, fleetCardEl, promptCardEl, promptEl, streamsEl, lendBtnEl, lendStatusEl;
+let shareBoxEl, inviteExpiryEl, fullLinkBtnEl, fleetCardEl, promptCardEl, promptEl, streamsEl, lendBtnEl, lendStatusEl;
 let acceptBtnEl, statusEl, progressEl, progressFillEl, modelStatusEl, codeEl, identityEl, borrowEl, borrowBtnEl, borrowHintEl, workerConsoleEl;
 
 function header() {
@@ -2303,9 +2336,20 @@ function controllerView() {
 
   shareBoxEl = el("input", { readonly: true, value: "", placeholder: "share link appears here" });
   inviteExpiryEl = el("div", { class: "muted small" });
+  // The box carries the short link (typable); the QR and this button carry
+  // the full link (a phone scans and auto-pairs, no code to read out).
+  fullLinkBtnEl = el("button", { class: "ghost small", text: "full link", hidden: "", onclick: async () => {
+    try {
+      await navigator.clipboard.writeText(await buildInviteUrl());
+      toast("full link copied");
+    } catch {
+      toast("could not copy — use the share box");
+    }
+  } });
   const shareRow = el("div", { class: "linkbox" }, [
     shareBoxEl,
     copyBtn("copy", () => shareBoxEl.value),
+    fullLinkBtnEl,
     el("button", { class: "ghost small", text: "renew link", onclick: renewInvite }),
   ]);
 
@@ -2636,7 +2680,7 @@ function simpleWorkerView() {
 
 function workerView() {
   const roomBox = el("div", { class: "row" }, [
-    el("span", { class: "badge", text: `room ${app.roomId}` }),
+    el("span", { class: "badge", text: `room ${app.roomId || "…"}` }),
     el("span", { class: "badge", text: app.hs }),
   ]);
 
@@ -2930,6 +2974,15 @@ async function main() {
     }
   }
   if (mode === "controller") app.bridgeInfo = await detectBridge();
+  // A short invite (`?r=<code>`) names no room: resolve the code to the fleet
+  // room before anything renders, so lease/verified resume reads the right
+  // keys and the room badge isn't null. A failure still renders the worker
+  // view (acceptDuty will re-ask and the toast already said so).
+  if (mode === "worker" && share?.shortCode) {
+    try {
+      await ensureMatrix();
+    } catch {}
+  }
   const skipped = sessionStorage.getItem("heimdall.skipSignIn") === "1";
   if (mode === "controller" && app.bridgeInfo && !signedIn() && !skipped) {
     // First screen on this computer: who is this fleet for.
