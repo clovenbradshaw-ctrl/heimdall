@@ -90,8 +90,14 @@ test("parseShareUrl: a bad code or no short param is null", () => {
   globalThis.location = prev;
 });
 
-test("the short form and the full form share the same site base", () => {
+test("the full invite offers the app page; the short form stays the site root", () => {
   const full = buildInviteUrl({ site: SITE, roomId: "!abc:hs", baseUrl: DEFAULT_HS, host: "@me:hs", name: "Me", exp: 123 });
   const short = buildShortUrl({ site: SITE, code: "h7q2x", baseUrl: DEFAULT_HS });
-  assert.equal(new URL(full).origin + new URL(full).pathname, new URL(short).origin + new URL(short).pathname);
+  // Same origin, different page: the QR goes to the app-install offer, the
+  // hand-typed short code goes to the browser worker.
+  assert.equal(new URL(full).origin, new URL(short).origin);
+  assert.equal(new URL(full).pathname, new URL(SITE).pathname.replace(/\/$/, "") + "/app.html");
+  assert.equal(new URL(short).origin + new URL(short).pathname, SITE);
+  // The invite keeps its room params for app.html's "continue in browser".
+  assert.equal(new URL(full).searchParams.get("room"), "!abc:hs");
 });

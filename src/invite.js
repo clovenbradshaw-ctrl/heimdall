@@ -88,7 +88,12 @@ export function pairingPayload(roomId, userId, deviceId, codeHash) {
 }
 
 export function buildInviteUrl({ site, roomId, baseUrl, host, name, exp }) {
-  return `${site}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}&host=${encodeURIComponent(host)}&name=${encodeURIComponent(name)}&exp=${exp}`;
+  // The invite lands on the app page (public/app.html) so a phone is offered a
+  // native install first; that page keeps these params for "continue in
+  // browser", which is the WebGPU worker path. Works the same on mac/win/linux.
+  const base = String(site).replace(/\?.*$/, "").replace(/\/+$/, "");
+  const root = /app\.html$/.test(base) ? base : `${base}/app.html`;
+  return `${root}?room=${encodeURIComponent(roomId)}&hs=${encodeURIComponent(baseUrl)}&host=${encodeURIComponent(host)}&name=${encodeURIComponent(name)}&exp=${exp}`;
 }
 
 /** The short invite link: the room's alias code, nothing else. `?r=<code>`

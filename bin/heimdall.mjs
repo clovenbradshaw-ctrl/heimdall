@@ -87,6 +87,27 @@ if (cmd === "login") {
   console.log("the 6-digit pairing code lives on the WORKER's device (its key fingerprint) —");
   console.log("have them read it to you, then Record it in the controller site (or fold).");
   console.log("keep the controller site open and signed into " + creds.userId + " so codes can be confirmed.");
+} else if (cmd === "link") {
+  const { probeEndpoint, upsertLink, saveLinks, loadLinks, guessTag, DEFAULT_LINKS_FILE } = await import("../src/links.mjs");
+  const url = !args[1] || args[1].startsWith("--") ? flag("--url", "") : args[1];
+  if (!url) {
+    console.error("usage: heimdall link <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");
+    process.exit(1);
+  }
+  const key = flag("--key", "") || null;
+  const probe = await probeEndpoint(url, { key });
+  if (!probe.ok) {
+    console.error(`no Ollama/OpenAI endpoint at ${url}: ${probe.error}`);
+    process.exit(1);
+  }
+  const model = flag("--model", probe.models[0] || "local");
+  const tag = flag("--tag", guessTag(model) || probe.models[0] || "local");
+  const name = flag("--name", probe.url.replace(/^https?:\/\//, ""));
+  const links = saveLinks(upsertLink(loadLinks(), { name, url: probe.url, kind: probe.kind, model, tag, models: probe.models, ...(key ? { key } : {}) }));
+  console.log(`linked  ${name}  (${probe.kind})  ${probe.url}`);
+  console.log(`models  ${probe.models.join(", ") || "(none reported)"}`);
+  console.log(`serves  ${tag}`);
+  console.log(`saved   ${DEFAULT_LINKS_FILE}  (${links.length} link${links.length === 1 ? "" : "s"})`);
 } else if (cmd === "reset") {
   save({});
   console.log("stored session cleared");
@@ -99,6 +120,8 @@ if (cmd === "login") {
   console.log("                   [--port 8790] [--no-open] [--no-passthrough] [--lend <ollama model>|none]");
   console.log("  heimdall invite  [--name \"Your Name\"] [--room !id:hs] [--new] [--hs URL]");
   console.log("                   [--user @me:hs --password …]");
+  console.log("  heimdall link    <host:port> [--tag gemma2:2b] [--model ID] [--key TOKEN] [--name phone]");
+  console.log("                   link a native app's local API (LAN or Tailscale) as a host");
   console.log("  heimdall login   --user @me:hs --password …");
   console.log("  heimdall reset");
   console.log("");
@@ -205,6 +228,7 @@ async function up() {
   console.log("");
   console.log("  1. the page opens — it makes the fleet and shows a QR code");
   console.log("  2. scan it with your phone, tap Accept, type the phone's code on the page");
+  console.log("     (or install a native app and link it at " + `http://localhost:${port}/link` + " — more reliable than WebGPU)");
   console.log("  3. point eoreader7 (or anything that speaks Ollama) at the fleet:");
   console.log(`       ER7_OLLAMA_HOSTS="local=${upstream},fleet=http://localhost:${port}"`);
   console.log("");

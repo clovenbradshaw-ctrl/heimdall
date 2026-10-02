@@ -38,6 +38,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { exec } from "node:child_process";
 import { answers, normalizeTag, ollamaTagOf } from "./models.js";
+import {
+  loadLinks, saveLinks, upsertLink, removeLink, probeEndpoint,
+  guessTag, resolveLink, linkAdvertisedModels, DEFAULT_LINKS_FILE,
+} from "./links.mjs";
 
 // The tab posts its state every 5 s — but a hidden tab's timers are throttled
 // to about once a minute, so the bridge also pings over the open event stream
@@ -81,13 +85,15 @@ export function createBridge({
   site = "https://clovenbradshaw-ctrl.github.io/heimdall/",
   lendModel = null,
   autoOpen = true, // try to open a controller tab ourselves when none is connected
+  linksFile = DEFAULT_LINKS_FILE,
   log = () => {},
 } = {}) {
   const tabs = new Set(); // open SSE responses; the newest one is the controller
   let state = null; // last state the tab posted
   let stateAt = 0;
   const jobs = new Map(); // id -> { onMsg }
-  const stats = { fleet: 0, passthrough: 0, fellThrough: 0 };
+  const stats = { fleet: 0, passthrough: 0, fellThrough: 0, native: 0 };
+  let links = loadLinks(linksFile); // native app servers linked by hand or the page
   const selfOrigins = new Set([`http://localhost:${port}`, `http://127.0.0.1:${port}`]);
   // Any page on THIS box, any port, may use the bridge from a browser (a
   // caller like the-fold's app.js is served from its own port and needs a
@@ -128,7 +134,11 @@ export function createBridge({
   // `any` (or `fleet`) asks for whatever a ready phone holds — the caller
   // chose not to pin a model. Every other name is pinned exactly.
   const isAny = (model) => model === "any" || model === "fleet";
-  const fleetServes = (model) => !!model && readyWorkers().some((w) => isAny(model) || answers(w.model, model));
+  // A native app host (linked by the page or `heimdall link`) answers the
+  // models it advertised; a browser worker answers the WebLLM ids it holds.
+  const linkedGiver = (model) => resolveLink(links, model);
+  const fleetServes = (model) =>
+    !!model && (!!linkedGiver(model) || readyWorkers().some((w) => isAny(model) || answers(w.model, model)));
 
   function toTab(msg) {
     const tab = [...tabs].at(-1);
@@ -182,6 +192,64 @@ export function createBridge({
     });
   }
 
+  /** Run one chat on a native app host. Speaks whichever wire it was probed
+   *  as (Ollama NDJSON or OpenAI SSE) and normalizes both to onToken(text).
+   *  Resolves { text, ms, tokens } or rejects { beforeFirstToken, message } —
+   *  the same contract runOnFleet keeps, so the caller's fall-through is one
+   *  code path either way. */
+  function runOnLink(link, { messages, temperature, max_tokens }, onToken) {
+    return new Promise(async (resolve, reject) => {
+      const t0 = Date.now();
+      const base = link.url.replace(/\/+$/, "");
+      const model = link.model || link.tag || "local";
+      const headers = { "content-type": "application/json" };
+      if (link.key) headers.authorization = `Bearer ${link.key}`;
+      const url = link.kind === "openai" ? `${base}/v1/chat/completions` : `${base}/api/chat`;
+      const body = link.kind === "openai"
+        ? { model, messages, temperature, max_tokens, stream: true }
+        : { model, messages, stream: true, options: { temperature, num_predict: max_tokens } };
+      let text = "";
+      let tokens = 0;
+      let buf = "";
+      // Feed complete lines to parse(); both wires are line-delimited (NDJSON
+      // for Ollama, `data: {...}` SSE for OpenAI).
+      const feed = (chunk) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).replace(/\r$/, "").trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const payload = link.kind === "openai" && line.startsWith("data:") ? line.slice(5).trim() : line;
+          if (!payload || payload === "[DONE]") continue;
+          let j;
+          try { j = JSON.parse(payload); } catch { continue; }
+          const delta = link.kind === "openai"
+            ? j.choices?.[0]?.delta?.content
+            : (j.message?.content ?? j.response);
+          if (j.error) { reject({ beforeFirstToken: tokens === 0, message: String(j.error?.message || j.error) }); return; }
+          if (typeof delta === "string" && delta) { text += delta; tokens++; onToken(delta); }
+        }
+      };
+      try {
+        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+        if (!r.ok || !r.body) throw new Error(`${link.kind || "app"} ${r.status}: ${await r.text().catch(() => "")}`);
+        for await (const chunk of r.body) feed(new TextDecoder().decode(chunk));
+        resolve({ text, ms: Date.now() - t0, tokens });
+      } catch (e) {
+        reject({ beforeFirstToken: tokens === 0, message: e?.message || "native host error" });
+      }
+    });
+  }
+
+  /** One chat on whichever giver is best: a linked native app first (real
+   *  GPU, survives without a controller tab), else the browser fleet. */
+  function runOnGiver(model, opts, onToken) {
+    const link = linkedGiver(model);
+    if (link) return runOnLink(link, opts, onToken);
+    return runOnFleet({ model, ...opts }, onToken);
+  }
+
   /* ---------------------------------------------------------- helpers */
 
   function readBody(req) {
@@ -196,6 +264,117 @@ export function createBridge({
   function json(res, code, obj) {
     res.writeHead(code, { "content-type": "application/json" });
     res.end(JSON.stringify(obj));
+  }
+
+  function sendHtml(res, html) {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+    res.end(html);
+  }
+
+  /** The native-app linking page: store links for the phone, a live tester to
+   *  add the app's server as a host. Served at /link on this bridge; works on
+   *  macOS, Windows and Linux (nothing platform-specific in it). */
+  function linkPage() {
+    const rows = links.map((l) =>
+      `<li><b>${l.name || l.url}</b> <span class=n>${l.kind || "?"}</span> <code>${l.url}</code>` +
+      (l.tag ? ` &rarr; <code>${l.tag}</code>` : "") +
+      ` <button data-url="${l.url}" class=rm>remove</button></li>`).join("");
+    return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Link a phone — heimdall</title>
+<style>
+  :root{color-scheme:dark light}body{font:16px/1.5 system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem}
+  h2{margin-top:1.6rem} .card{border:1px solid #8884;border-radius:10px;padding:1rem;margin:.6rem 0}
+  a.btn{display:inline-block;margin:.25rem .4rem .25rem 0;padding:.5rem .8rem;border:1px solid #8886;border-radius:8px;text-decoration:none;color:inherit}
+  a.btn.hot{border-color:#4ea1ff;box-shadow:0 0 0 1px #4ea1ff}
+  code{background:#8882;padding:.1rem .3rem;border-radius:4px} input,select{font:inherit;padding:.4rem;border:1px solid #8886;border-radius:8px;background:transparent;color:inherit}
+  input[type=text]{width:min(420px,90vw)} .n{opacity:.7;font-size:.85em} li{margin:.35rem 0}
+  .ok{color:#3fb950}.bad{color:#f85149}.rm{font-size:.8em}
+</style>
+<h1>Link a phone</h1>
+<p>WebGPU in a phone browser is unreliable. A native app runs the model on the
+phone's real GPU and serves an Ollama/OpenAI API. The phone can be on your LAN
+<i>or</i> on a Tailscale address, so this works across networks.</p>
+
+<h2>1. Install</h2>
+<div class=card>
+  <div><b>Android</b> — <a class=btn data-os=android href="https://play.google.com/store/apps/details?id=com.micklab.llama">LLM AI Server with llama.cpp</a>
+  <a class=btn data-os=android href="https://play.google.com/store/apps/details?id=com.llmproxy">Ollama Local AI — Phone IDE</a></div>
+  <div style="margin-top:.5rem"><b>iOS</b> — <a class=btn data-os=ios href="https://apps.apple.com/us/app/on-device-llm/id6770114399">OnDevice LLM</a></div>
+</div>
+
+<h2>2. Start its server</h2>
+<div class=card>Open the app, download a model, and start the local API server.
+It shows an address like <code>http://100.64.0.7:8000</code> (Tailscale) or
+<code>http://192.168.1.50:8080</code> (LAN). Keep the app in the foreground —
+iOS/Android suspend a background server.</div>
+
+<h2>3. Link it</h2>
+<div class=card>
+  <input id=url type=text placeholder="100.64.0.7:8000"><br><br>
+  <input id=key type=text placeholder="API key (only if the app requires one)"><br><br>
+  <label>Advertise as Ollama tag <input id=tag type=text placeholder="auto from the model" style="width:auto"></label><br><br>
+  <button id=test>Test</button> <button id=add>Test &amp; add</button>
+  <div id=msg style="margin-top:.6rem"></div>
+</div>
+
+<h2>Linked hosts</h2>
+<ul id=list>${rows || "<li class=n>none yet</li>"}</ul>
+<p class=n>Saved to <code>${linksFile}</code>. This bridge already exposes them
+to eoreader7 as one host — <code>ER7_OLLAMA_HOSTS="…,fleet=http://localhost:${port}"</code>.</p>
+
+<script>
+  var msg = document.getElementById("msg");
+  function show(ok, text){ msg.className = ok ? "ok" : "bad"; msg.textContent = text; }
+  function refresh(){
+    fetch("/link/hosts").then(function(r){return r.json()}).then(function(j){
+      var ul = document.getElementById("list");
+      if(!j.links.length){ ul.innerHTML = "<li class=n>none yet</li>"; return; }
+      ul.innerHTML = j.links.map(function(l){
+        return "<li><b>"+(l.name||l.url)+"</b> <span class=n>"+(l.kind||"?")+"</span> <code>"+l.url+"</code>"+
+          (l.tag?" &rarr; <code>"+l.tag+"</code>":"")+" <button class=rm data-url='"+l.url+"'>remove</button></li>";
+      }).join("");
+    });
+  }
+  function probe(){
+    var url = document.getElementById("url").value;
+    return fetch("/link/probe",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({url:url,key:document.getElementById("key").value||null})}).then(function(r){return r.json()});
+  }
+  document.getElementById("test").onclick = function(){
+    show(true,"testing…");
+    probe().then(function(p){
+      if(!p.ok) return show(false,"no answer: "+(p.error||"unknown"));
+      show(true,"ok — "+p.kind+" — "+p.models.join(", "));
+      if(!document.getElementById("tag").value && p.models[0]) document.getElementById("tag").value = p.models[0];
+    }).catch(function(e){ show(false,String(e)); });
+  };
+  document.getElementById("add").onclick = function(){
+    var url = document.getElementById("url").value;
+    var tag = document.getElementById("tag").value || null;
+    show(true,"testing…");
+    probe().then(function(p){
+      if(!p.ok) return show(false,"no answer: "+(p.error||"unknown"));
+      return fetch("/link/host",{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({url:url,key:document.getElementById("key").value||null,tag:tag,model:p.models[0]})})
+        .then(function(r){return r.json()}).then(function(j){
+          if(!j.ok) return show(false,j.error||"could not link");
+          show(true,"linked "+p.models[0]+" as "+ (j.links[j.links.length-1].tag||"") );
+          refresh();
+        });
+    }).catch(function(e){ show(false,String(e)); });
+  };
+  document.addEventListener("click", function(e){
+    if(e.target.classList && e.target.classList.contains("rm")){
+      fetch("/link/remove",{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({url:e.target.getAttribute("data-url")})}).then(refresh);
+    }
+  });
+  // highlight the store button for this device's OS
+  var ios = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  document.querySelectorAll("a.btn[data-os]").forEach(function(a){
+    if((a.dataset.os==="ios") === ios) a.classList.add("hot");
+  });
+</script>`;
   }
 
   async function pipeUpstream(req, res, raw, urlPath = req.url) {
@@ -261,6 +440,22 @@ export function createBridge({
         });
       }
     }
+    // Native app hosts advertise under their own tag and reported model ids.
+    for (const l of links) {
+      for (const name of linkAdvertisedModels(l)) {
+        const cur = seen.get(name);
+        if (cur) { cur.heimdall.native = l.name; continue; }
+        seen.set(name, {
+          name,
+          model: name,
+          modified_at: new Date().toISOString(),
+          size: 0,
+          digest: "",
+          details: { parent_model: "", format: l.kind || "native", family: name.split(":")[0], families: [name.split(":")[0]], parameter_size: name.split(":")[1]?.toUpperCase() ?? "", quantization_level: "" },
+          heimdall: { native: l.name, url: l.url, kind: l.kind, queueDepth: 0 },
+        });
+      }
+    }
     return [...seen.values()];
   }
 
@@ -308,8 +503,9 @@ export function createBridge({
       if (stream) res.writeHead(200, { "content-type": "application/x-ndjson" });
     };
     try {
-      const out = await runOnFleet(
-        { model: b.model, messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.num_predict > 0 ? opts.num_predict : 1024 },
+      const out = await runOnGiver(
+        b.model,
+        { messages, temperature: opts.temperature ?? 0.7, max_tokens: opts.num_predict > 0 ? opts.num_predict : 1024 },
         (delta) => {
           start();
           if (stream) res.write(JSON.stringify(line(delta)) + "\n");
@@ -352,8 +548,9 @@ export function createBridge({
       res.write(`data: ${JSON.stringify(chunk({ role: "assistant", content: "" }))}\n\n`);
     };
     try {
-      const out = await runOnFleet(
-        { model: b.model, messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 1024 },
+      const out = await runOnGiver(
+        b.model,
+        { messages, temperature: b.temperature ?? 0.7, max_tokens: b.max_tokens ?? b.max_completion_tokens ?? 1024 },
         (delta) => { start(); if (b.stream) res.write(`data: ${JSON.stringify(chunk({ content: delta }))}\n\n`); },
       );
       stats.fleet++;
@@ -453,7 +650,32 @@ export function createBridge({
           // `pending` is this bridge's own in-flight fleet jobs — measured
           // here, not reported by the tab, so it's never stale between the
           // tab's 5s state posts.
-          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, pending: jobs.size, stats, upstream, passthrough, diag: state?.diag ?? {}, hostRecv: state?.hostRecv ?? [] });
+          return json(res, 200, { tab: tabAlive(), room: state?.room ?? null, workers: state?.workers ?? [], lending: state?.self ?? null, pending: jobs.size, stats, upstream, passthrough, links, linksFile, diag: state?.diag ?? {}, hostRecv: state?.hostRecv ?? [] });
+        case "GET /link":
+        case "GET /link/":
+          return sendHtml(res, linkPage());
+        case "GET /link/hosts":
+          return json(res, 200, { links });
+        case "POST /link/probe": {
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          return json(res, 200, await probeEndpoint(b.url, { key: b.key || null }));
+        }
+        case "POST /link/host": {
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          const probe = await probeEndpoint(b.url, { key: b.key || null });
+          if (!probe.ok) return json(res, 400, probe);
+          const model = b.model || probe.models[0] || "local";
+          const tag = b.tag || guessTag(model) || probe.models[0] || "local";
+          const name = b.name || probe.url.replace(/^https?:\/\//, "");
+          links = saveLinks(upsertLink(links, { name, url: probe.url, kind: probe.kind, model, tag, models: probe.models, ...(b.key ? { key: b.key } : {}) }), linksFile);
+          log(`linked native host ${name} (${probe.kind}) at ${probe.url} → ${tag}`);
+          return json(res, 200, { ok: true, links });
+        }
+        case "POST /link/remove": {
+          const b = JSON.parse((await readBody(req)).toString() || "{}");
+          links = saveLinks(removeLink(links, b.url), linksFile);
+          return json(res, 200, { ok: true, links });
+        }
         case "GET /api/version":
           return json(res, 200, { version: "0.0.0-heimdall-bridge" });
         case "GET /api/ps":
