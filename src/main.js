@@ -41,7 +41,7 @@ import {
 } from "./invite.js";
 
 const DEFAULT_HS = "https://hyphae.social";
-const PUBLIC_SITE = "https://clovenbradshaw-ctrl.github.io/heimdall/";
+const PUBLIC_SITE = "https://scores-patch-points.github.io/heimdall/";
 // The local bridge (`heimdall up`) borrows under this key. No worker's
 // deviceKey can equal it (those are "@user:hs|DEVICE"), so a worker can
 // never claim the bridge's exemption from the credit gate.
@@ -53,8 +53,8 @@ const NAME_KEY = "heimdall.name.v1";
 const INVITE_TTL = 7 * 24 * 3600 * 1000; // a share link is good for 7 days
 const LEASE_TTL = 12 * 3600 * 1000; // an accepted lease lasts 12h, then must be renewed
 
-const FOLD_REPO = "https://github.com/clovenbradshaw-ctrl/the-fold.git";
-const FOLD_WEB = "https://clovenbradshaw-ctrl.github.io/the-fold/";
+const FOLD_REPO = "https://github.com/scores-patch-points/the-fold.git";
+const FOLD_WEB = "https://scores-patch-points.github.io/the-fold/";
 const FOLD_CMD = `git clone ${FOLD_REPO} && cd the-fold && ./fold`;
 
 const share = parseShareUrl();
@@ -2395,7 +2395,7 @@ function controllerView() {
     el("span", { class: "muted small", text: "their code → you record it → they accept" }),
   ]);
 
-  const cliCmd = "npx --yes github:clovenbradshaw-ctrl/heimdall invite";
+  const cliCmd = "npx --yes github:scores-patch-points/heimdall invite";
   const cliRow = el("div", { class: "row" }, [
     el("span", { class: "muted small", text: "or mint the link from any terminal / the fold:" }),
     el("code", { text: cliCmd }),

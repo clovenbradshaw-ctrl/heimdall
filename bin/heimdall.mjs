@@ -14,7 +14,7 @@ import { spawnSync, spawn } from "node:child_process";
 const matrixLib = () => import("../src/matrix.js");
 const inviteLib = () => import("../src/invite.js");
 
-const SITE = process.env.HEIMDALL_SITE || "https://clovenbradshaw-ctrl.github.io/heimdall/";
+const SITE = process.env.HEIMDALL_SITE || "https://scores-patch-points.github.io/heimdall/";
 const HS = "https://hyphae.social";
 const STATE_DIR = join(homedir(), ".heimdall");
 const STATE = join(STATE_DIR, "state.json");

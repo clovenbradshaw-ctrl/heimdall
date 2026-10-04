@@ -82,7 +82,7 @@ export function createBridge({
   dist,
   upstream = "http://127.0.0.1:11434",
   passthrough = true,
-  site = "https://clovenbradshaw-ctrl.github.io/heimdall/",
+  site = "https://scores-patch-points.github.io/heimdall/",
   lendModel = null,
   autoOpen = true, // try to open a controller tab ourselves when none is connected
   linksFile = DEFAULT_LINKS_FILE,

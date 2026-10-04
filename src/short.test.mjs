@@ -8,7 +8,7 @@ import { shortCode, SHORT_ALPHABET, SHORT_LENGTH, hostOf, aliasTaken } from "./m
 import { buildShortUrl, buildInviteUrl, DEFAULT_HS } from "./invite.js";
 import { parseShareUrl } from "./matrix.js";
 
-const SITE = "https://clovenbradshaw-ctrl.github.io/heimdall/";
+const SITE = "https://scores-patch-points.github.io/heimdall/";
 
 test("shortCode: SHORT_LENGTH chars, all from the no-confusion alphabet", () => {
   for (let i = 0; i < 200; i++) {

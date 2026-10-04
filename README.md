@@ -21,7 +21,7 @@ central server.
 ## Your phone and this computer, one fleet
 
 ```bash
-npx --yes github:clovenbradshaw-ctrl/heimdall up
+npx --yes github:scores-patch-points/heimdall up
 ```
 
 (or `npm run up` in a checkout, or the Fold: Heimdall sheet → **Connect your phone**.)
@@ -121,9 +121,9 @@ without giving**:
 
 The same page that hands out the compute link doubles as the fold's door:
 
-- **Try it in this browser** — `https://clovenbradshaw-ctrl.github.io/the-fold/`
+- **Try it in this browser** — `https://scores-patch-points.github.io/the-fold/`
   (static build, WebGPU in-tab models, no install).
-- **Run it locally** — `git clone https://github.com/clovenbradshaw-ctrl/the-fold.git && cd the-fold && ./fold`
+- **Run it locally** — `git clone https://github.com/scores-patch-points/the-fold.git && cd the-fold && ./fold`
   → opens `http://localhost:8811`. Needs git + Node ≥ 20.11; the script
   installs Ollama (`gemma2:2b`) for you.
 
@@ -136,7 +136,7 @@ confirm codes. The worker's device holds its own keypair, so the pairing
 proof travels with the worker, not the surface.
 
 - **This site.** Controller mode → Create fleet room → copy link + code.
-- **Any terminal.** `npx --yes github:clovenbradshaw-ctrl/heimdall invite`
+- **Any terminal.** `npx --yes github:scores-patch-points/heimdall invite`
   prints the link and code, and remembers the session in `~/.heimdall/state.json`.
   Options: `--name "Your Name"`, `--room !id:hs` (reuse a fleet), `--new`,
   `--user @me:hs --password …` (use your own account), `--hs URL`. Also
@@ -148,7 +148,7 @@ proof travels with the worker, not the surface.
 
 **Short links, for a computer you have to type on.** Every fleet room is born
 with a short local alias, so the same invite also exists as a link you can
-type by hand: `https://clovenbradshaw-ctrl.github.io/heimdall/?r=h7q2x` (or
+type by hand: `https://scores-patch-points.github.io/heimdall/?r=h7q2x` (or
 `.../heimdall/h7q2x` — the 404 page rewrites the path). The code *is* the
 room's alias; the page resolves it and then runs the normal worker flow:
 identity is still verified against the room's creator, and pairing still
