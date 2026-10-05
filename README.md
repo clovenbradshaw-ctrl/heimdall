@@ -1,3 +1,8 @@
+> ## ⚠️ LEGACY — frozen, no longer maintained
+> This repository is the **old copy** of `heimdall` and is kept for history only.
+> The Fold now lives under the `scores-patch-points` account: [scores-patch-points/heimdall](https://github.com/scores-patch-points/heimdall).
+> Do not file issues or send changes here.
+
 # heimdall
 
 Distributed local inference. You get a link. Anyone who opens it and presses
